@@ -131,7 +131,7 @@ def dashboard(request:Request):
 def admin_home(request:Request):
     u=require_admin(request)
     with SessionLocal() as db:
-        nav=get_setting(db,"nav_usd","");limit=get_setting(db,"limit_pct","15");ver=get_setting(db,"config_version","1")
+        nav=get_setting(db,"nav_usd","");limit=get_setting(db,"limit_pct","15");ver=get_setting(db,"config_version","1");nav_display=f"{float(nav):,.2f}"
         pos=db.query(Position).order_by(Position.active.desc(),Position.ticker,Position.expiry,Position.strike).all()
         today=date.today().isoformat();rows=""
         for p in pos:
@@ -140,7 +140,7 @@ def admin_home(request:Request):
 <form method="post" action="/admin/positions/{p.id}/archive" style="display:inline"><button class="danger">Archive</button></form>"""
             rows+=f'<tr><td>{p.ticker}</td><td>{p.expiry}</td><td>{p.option_type}</td><td>{p.strike:g}</td><td>{p.quantity:,.0f}</td><td>{status}</td><td>{html.escape(p.bloomberg_security)}</td><td>{action}</td></tr>'
         body=admin_tabs()+f"""<div class="card"><h2>Admin — Fuat only</h2><div class="notice">Only Fuat can change portfolio, NAV, limit and users. Viewers are read-only.</div></div>
-<div class="card"><h3>Fund Settings — Config v{ver}</h3><form method="post" action="/admin/settings" class="row"><label>NAV USD<input name="nav_usd" value="{nav}"></label><label>Delta Limit %<input name="limit_pct" value="{limit}"></label><button>Publish</button></form></div>
+<div class="card"><h3>Fund Settings — Config v{ver}</h3><form method="post" action="/admin/settings" class="row"><label>NAV USD<input name="nav_usd" value="{nav_display}"></label><label>Delta Limit %<input name="limit_pct" value="{limit}"></label><button>Publish</button></form></div>
 <div class="card"><h3>Add Position</h3><form method="post" action="/admin/positions/add" class="row"><label>Ticker<input name="ticker" required></label><label>Expiry YYYY-MM-DD<input name="expiry" required></label><label>Type<select name="option_type"><option>P</option><option>C</option></select></label><label>Strike<input name="strike" required></label><label>Qty<input name="quantity" required></label><label>Multiplier<input name="multiplier" value="100"></label><button>Add & Publish</button></form></div>
 <div class="card"><h3>Portfolio</h3><table><thead><tr><th>Ticker</th><th>Expiry</th><th>Type</th><th>Strike</th><th>Qty</th><th>Status</th><th>Bloomberg Security</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>"""
         return page("Admin",body,u)
