@@ -56,17 +56,17 @@ def page(title,body,user=None,refresh=None):
     return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">{rf}<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title><style>
 body{{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#172033}}.wrap{{max-width:1280px;margin:auto;padding:22px}}
-nav{{display:flex;justify-content:space-between;margin-bottom:18px}}nav a{{margin-left:12px}}.card{{background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:16px;margin-bottom:14px}}
+nav{{display:flex;justify-content:space-between;margin-bottom:18px}}nav a{{margin-left:12px}}.brand{{color:#172033;text-decoration:none}}.card{{background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:16px;margin-bottom:14px}}
 .grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}}.metric .v{{font-size:25px;font-weight:700;margin-top:6px}}.muted{{color:#6d7b92;font-size:13px}}
 .ok{{color:#067647}}.bad{{color:#b42318}}.notice{{padding:10px 12px;background:#fff7e6;border:1px solid #ffd591;border-radius:8px}}
 table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #e6ebf2;padding:9px;text-align:right;font-size:13px}}th:first-child,td:first-child{{text-align:left}}
 input,select,button{{padding:8px;border:1px solid #c9d3e1;border-radius:7px}}button{{background:#172b4d;color:white;cursor:pointer}}.danger{{background:#b42318}}.secondary{{background:#52657d}}
 .row{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}label{{display:flex;flex-direction:column;font-size:12px;color:#52657d;gap:4px}}
 @media(max-width:900px){{.grid{{grid-template-columns:1fr 1fr}}}}
-</style></head><body><div class="wrap"><nav><strong>Fortress Delta Monitor</strong><div>{auth}</div></nav>{body}</div></body></html>""")
+</style></head><body><div class="wrap"><nav><strong><a class="brand" href="/">Fortress Delta Monitor</a></strong><div>{auth}</div></nav>{body}</div></body></html>""")
 
 def admin_tabs():
-    return '<p><a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
+    return '<p><a href="/">Dashboard</a> · <a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
 
 @app.get("/health")
 def health():return {"ok":True}
