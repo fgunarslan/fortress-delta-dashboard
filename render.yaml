@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: fortress-delta-dashboard
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: INGEST_TOKEN
+        sync: false
+      - key: VIEW_USER
+        sync: false
+      - key: VIEW_PASSWORD
+        sync: false
+      - key: STALE_AFTER_SECONDS
+        value: "20"
