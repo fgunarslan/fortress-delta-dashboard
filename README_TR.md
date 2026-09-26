@@ -1,43 +1,37 @@
-# Fortress Delta Web Dashboard v1
+# Fortress Delta Web Dashboard v2
 
-Bu web uygulaması Bloomberg PC'deki collector'dan yalnızca türetilmiş risk metriklerini alır.
+## Yetkiler
+- `fuat` sabit ve tek admin.
+- Fuat viewer kullanıcı ekleyebilir, disable/enable edebilir, parola resetleyebilir ve silebilir.
+- Başka admin hesabı oluşturulamaz.
+- Viewer yalnızca canlı dashboard'u görür.
+- Portfolio/NAV/limit/Nirvana import işlemleri yalnızca Fuat'tadır.
+- Admin işlemleri Audit Log'a kaydedilir.
 
-## Ortam değişkenleri
-- INGEST_TOKEN: Collector'ın /api/ingest endpoint'ine bağlanırken kullanacağı uzun gizli token.
-- VIEW_USER: Portal görüntüleme kullanıcı adı.
-- VIEW_PASSWORD: Portal görüntüleme parolası.
-- STALE_AFTER_SECONDS: Collector verisi kaç saniye gelmezse OFFLINE gösterileceği. Varsayılan 20.
+## Uzaktan portföy yönetimi
+Collector local positions.csv kullanmaz.
+Portal `/api/collector/config` endpoint'inden aktif portföy, NAV, limit ve config version yayınlar.
+Her değişiklikte version artar; Bloomberg PC collector yeni versiyonu otomatik çeker.
 
-## Endpointler
-- POST /api/ingest — Collector için Bearer token korumalı.
-- GET / — Basic Auth korumalı dashboard.
-- GET /api/snapshot — Basic Auth korumalı JSON.
-- GET /health — Sağlık kontrolü.
+## Nirvana import
+Admin > Nirvana Import:
+1. CSV/XLSX yükle.
+2. Kolonları eşle.
+3. Added / Changed / Missing preview'ını gör.
+4. Replace veya Merge seç.
+5. Confirm & Publish.
 
-## Render üzerinde hızlı deployment
-1. Bu klasörü private bir GitHub repository'ye yükleyin.
-2. Render > New > Web Service > GitHub repository'yi seçin.
-3. Runtime: Python
-4. Build command: pip install -r requirements.txt
-5. Start command: uvicorn app:app --host 0.0.0.0 --port $PORT
-6. Environment variables ekleyin:
-   INGEST_TOKEN=<uzun rastgele token>
-   VIEW_USER=fuat
-   VIEW_PASSWORD=<güçlü portal parolası>
-   STALE_AFTER_SECONDS=20
-7. Deploy edin.
-8. Render size bir HTTPS URL verir. Örnek:
-   https://fortress-delta-dashboard.onrender.com
-9. Collector içindeki Portal ingest URL alanına:
-   https://fortress-delta-dashboard.onrender.com/api/ingest
-   yazın.
-10. Collector'a aynı INGEST_TOKEN değerini girin.
+Replace: dosyada olmayan aktif pozisyonlar archive edilir.
+Merge: dosyada olmayan pozisyonlara dokunulmaz.
 
-## Token üretme
-Bilgisayarınızda:
-python generate_secret.py
+## Expiry
+Expiry tarihi bugünden eski olan pozisyon collector config'ine otomatik gönderilmez; audit/history'de kalır.
 
-çıktısını kopyalayın. Bu token Bloomberg parolası değildir.
+## Render Environment Variables
+DATABASE_URL=<kalıcı PostgreSQL connection string>
+APP_SECRET=<generate_secrets.py çıktısı>
+COLLECTOR_TOKEN=<generate_secrets.py çıktısı>
+ADMIN_PASSWORD=<Fuat admin parolası>
+STALE_AFTER_SECONDS=20
 
-## Not
-Bu prototip yalnızca son snapshot'ı RAM'de tutar. Server yeniden başlarsa sayfa collector'ın bir sonraki push'una kadar WAITING gösterir. Bu canlı monitor için bilinçli bir tasarımdır.
+Gerçek kullanımda kalıcı PostgreSQL kullanın. Render ephemeral filesystem üzerinde SQLite, deploy/restart sonrası veri kaybı yaratabilir.
