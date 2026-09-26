@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse,RedirectResponse
 
 from db import SessionLocal,User,Setting,Position,Audit,Snapshot,ImportJob,get_setting,set_setting,audit,config_bump,utcnow
 from security import ADMIN_USER,ensure_admin,hash_password,verify_password,sign_session,read_session
-from helpers import option_security,detect_map,parse_upload,normalized_import,keypos
+from helpers import option_security,detect_map,parse_upload,parse_nirvana_exposure_rows,normalized_import,keypos
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=int(os.getenv("STALE_AFTER_SECONDS","20"))
@@ -247,19 +247,64 @@ def audit_page(request:Request):
 @app.get("/admin/import")
 def import_get(request:Request):
     u=require_admin(request)
-    return page("Nirvana Import",admin_tabs()+"""<div class="card"><h2>Nirvana Position Import</h2><p>Upload CSV or XLSX. Map columns and preview before publishing.</p>
+    return page("Nirvana Import",admin_tabs()+"""<div class="card"><h2>Nirvana Position Import</h2>
+<p>Upload the Nirvana <strong>Exposure Summary by Underlying</strong> XLSX directly. The portal recognizes this report automatically, extracts the real option rows, NAV and quantities, then shows a preview before anything changes.</p>
+<p class="muted">Generic CSV/XLSX files are still supported with manual column mapping.</p>
 <form method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx,.csv" required><button>Upload & Preview</button></form></div>""",u)
+
+def _compare_import(parsed,current):
+    cur={keypos(x):x for x in current};new={keypos(x):x for x in parsed}
+    added=[x for k,x in new.items() if k not in cur]
+    changed=[(cur[k],x) for k,x in new.items() if k in cur and (float(cur[k]["quantity"])!=float(x["quantity"]) or float(cur[k]["multiplier"])!=float(x["multiplier"]))]
+    missing=[x for k,x in cur.items() if k not in new]
+    return added,changed,missing
+
+def _preview_html(jid,parsed,errors,current,mapping,report_nav=None,current_nav=None,report_date=None,auto=False):
+    added,changed,missing=_compare_import(parsed,current)
+    def fmt(x):return f'{x["ticker"]} {x["expiry"]} {x["option_type"]}{x["strike"]:g} qty={x["quantity"]:,.0f}'
+    detail="<h3>Added</h3><ul>"+"".join(f"<li>{html.escape(fmt(x))}</li>" for x in added[:50])+"</ul>"
+    detail+="<h3>Changed</h3><ul>"+"".join(f'<li>{html.escape(fmt(a))} → qty={b["quantity"]:,.0f}</li>' for a,b in changed[:50])+"</ul>"
+    detail+="<h3>Missing from uploaded file</h3><ul>"+"".join(f"<li>{html.escape(fmt(x))}</li>" for x in missing[:50])+"</ul>"
+    if errors:detail+="<h3>Parse errors</h3><pre>"+html.escape("\n".join(errors[:30]))+"</pre>"
+    navline=""
+    if report_nav:
+        navline=f'<div class="notice"><strong>NAV from Nirvana:</strong> ${report_nav:,.2f}'
+        if current_nav is not None:navline+=f' &nbsp; | &nbsp; Current portal NAV: ${current_nav:,.2f}'
+        navline+=' &nbsp; — NAV will be updated when you Confirm & Publish.</div><br>'
+    source='Nirvana Exposure Summary auto-detected' if auto else 'Generic mapped import'
+    if report_date:source+=f' · Report Date {html.escape(str(report_date))}'
+    mj=quote(json.dumps(mapping))
+    return admin_tabs()+f"""<div class="card"><h2>Import Preview</h2><p><strong>{source}</strong></p>{navline}
+<p><strong>Parsed option positions:</strong> {len(parsed)} · <strong>Added:</strong> {len(added)} · <strong>Changed:</strong> {len(changed)} · <strong>Missing:</strong> {len(missing)} · <strong>Parse errors:</strong> {len(errors)}</p>{detail}
+<form method="post" action="/admin/import/{jid}/apply"><input type="hidden" name="mapping_json" value="{html.escape(mj)}"><label>Mode<select name="mode"><option value="replace">Replace active portfolio — missing positions archived</option><option value="merge">Merge/update only — missing positions untouched</option></select></label><br><br><button>Confirm & Publish</button> <a href="/admin/import">Cancel</a></form></div>"""
 
 @app.post("/admin/import")
 async def import_upload(request:Request,file:UploadFile=File(...)):
-    u=require_admin(request);data=await file.read();headers,rows=parse_upload(data,file.filename or "upload")
+    u=require_admin(request)
+    data=await file.read()
+    headers,rows,meta=parse_upload(data,file.filename or "upload")
     if not rows:raise HTTPException(400,"No rows found")
-    mapping=detect_map(headers);jid=uuid.uuid4().hex
+    jid=uuid.uuid4().hex
+    envelope={"headers":headers,"meta":meta}
     with SessionLocal() as db:
-        db.add(ImportJob(id=jid,filename=file.filename or "upload",headers_json=json.dumps(headers),rows_json=json.dumps(rows,default=str)));audit(db,u["username"],"NIRVANA_FILE_UPLOADED",f"{file.filename}; rows={len(rows)}");db.commit()
+        db.add(ImportJob(id=jid,filename=file.filename or "upload",headers_json=json.dumps(envelope),rows_json=json.dumps(rows,default=str)))
+        audit(db,u["username"],"NIRVANA_FILE_UPLOADED",f"{file.filename}; rows={len(rows)}; format={meta.get('format')}")
+        db.commit()
+
+    if meta.get("format")=="nirvana_exposure_by_underlying":
+        parsed,errors,_=parse_nirvana_exposure_rows(rows)
+        if not parsed:raise HTTPException(400,"Nirvana report detected but no option rows could be parsed.")
+        with SessionLocal() as db:
+            current=[{"ticker":p.ticker,"expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,"multiplier":p.multiplier} for p in db.query(Position).filter_by(active=True).all()]
+            current_nav=float(get_setting(db,"nav_usd","0") or 0)
+        mapping={"format":"nirvana_exposure_by_underlying"}
+        body=_preview_html(jid,parsed,errors,current,mapping,meta.get("nav_usd"),current_nav,meta.get("report_date"),True)
+        return page("Nirvana Import Preview",body,u)
+
+    mapping=detect_map(headers)
     def opts(sel=""):
         return "".join(f'<option value="{html.escape(h)}" {"selected" if h==sel else ""}>{html.escape(h)}</option>' for h in headers)
-    body=admin_tabs()+f"""<div class="card"><h2>Map Nirvana Columns</h2><p>{html.escape(file.filename or "")}: {len(rows)} rows</p><form method="post" action="/admin/import/{jid}/preview"><div class="row">
+    body=admin_tabs()+f"""<div class="card"><h2>Map Columns</h2><p>{html.escape(file.filename or "")}: {len(rows)} rows</p><form method="post" action="/admin/import/{jid}/preview"><div class="row">
 <label>Ticker<select name="ticker_col">{opts(mapping.get("ticker",""))}</select></label><label>Expiry<select name="expiry_col">{opts(mapping.get("expiry",""))}</select></label>
 <label>Put/Call<select name="type_col">{opts(mapping.get("option_type",""))}</select></label><label>Strike<select name="strike_col">{opts(mapping.get("strike",""))}</select></label>
 <label>Quantity<select name="qty_col">{opts(mapping.get("quantity",""))}</select></label><label>Multiplier<select name="mult_col"><option value="">Default 100</option>{opts(mapping.get("multiplier",""))}</select></label></div><br><button>Build Preview</button></form></div>"""
@@ -273,16 +318,7 @@ def import_preview(request:Request,jid:str,ticker_col:str=Form(...),expiry_col:s
         if not job:raise HTTPException(404)
         parsed,errors=normalized_import(json.loads(job.rows_json),mapping)
         current=[{"ticker":p.ticker,"expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,"multiplier":p.multiplier} for p in db.query(Position).filter_by(active=True).all()]
-    cur={keypos(x):x for x in current};new={keypos(x):x for x in parsed}
-    added=[x for k,x in new.items() if k not in cur];changed=[(cur[k],x) for k,x in new.items() if k in cur and (float(cur[k]["quantity"])!=float(x["quantity"]) or float(cur[k]["multiplier"])!=float(x["multiplier"]))];missing=[x for k,x in cur.items() if k not in new]
-    def fmt(x):return f'{x["ticker"]} {x["expiry"]} {x["option_type"]}{x["strike"]:g} qty={x["quantity"]:,.0f}'
-    detail="<h3>Added</h3><ul>"+"".join(f"<li>{html.escape(fmt(x))}</li>" for x in added[:50])+"</ul>"
-    detail+="<h3>Changed</h3><ul>"+"".join(f'<li>{html.escape(fmt(a))} → qty={b["quantity"]:,.0f}</li>' for a,b in changed[:50])+"</ul>"
-    detail+="<h3>Missing from uploaded file</h3><ul>"+"".join(f"<li>{html.escape(fmt(x))}</li>" for x in missing[:50])+"</ul>"
-    if errors:detail+="<h3>Parse errors</h3><pre>"+html.escape("\n".join(errors[:30]))+"</pre>"
-    mj=quote(json.dumps(mapping))
-    body=admin_tabs()+f"""<div class="card"><h2>Import Preview</h2><p><strong>Added:</strong> {len(added)} · <strong>Changed:</strong> {len(changed)} · <strong>Missing:</strong> {len(missing)} · <strong>Parse errors:</strong> {len(errors)}</p>{detail}
-<form method="post" action="/admin/import/{jid}/apply"><input type="hidden" name="mapping_json" value="{html.escape(mj)}"><label>Mode<select name="mode"><option value="replace">Replace active portfolio — missing positions archived</option><option value="merge">Merge/update only — missing positions untouched</option></select></label><br><br><button>Confirm & Publish</button></form></div>"""
+    body=_preview_html(jid,parsed,errors,current,mapping)
     return page("Import Preview",body,u)
 
 @app.post("/admin/import/{jid}/apply")
@@ -291,8 +327,16 @@ def import_apply(request:Request,jid:str,mapping_json:str=Form(...),mode:str=For
     with SessionLocal() as db:
         job=db.get(ImportJob,jid)
         if not job:raise HTTPException(404)
-        parsed,errors=normalized_import(json.loads(job.rows_json),mapping)
-        if errors and len(errors)>max(3,len(parsed)//10):raise HTTPException(400,"Too many parse errors")
+        rows=json.loads(job.rows_json)
+        try:envelope=json.loads(job.headers_json)
+        except Exception:envelope={"headers":[],"meta":{}}
+        meta=envelope.get("meta",{}) if isinstance(envelope,dict) else {}
+        if mapping.get("format")=="nirvana_exposure_by_underlying":
+            parsed,errors,_=parse_nirvana_exposure_rows(rows)
+        else:
+            parsed,errors=normalized_import(rows,mapping)
+        if not parsed:raise HTTPException(400,"No valid option positions parsed; nothing was changed.")
+        if errors and len(errors)>max(3,len(parsed)//10):raise HTTPException(400,"Too many parse errors; nothing was changed.")
         active=db.query(Position).filter_by(active=True).all();cur={(p.ticker,p.expiry,p.option_type,round(p.strike,6)):p for p in active};incoming={keypos(x):x for x in parsed}
         added=changed=archived=0
         for k,x in incoming.items():
@@ -305,7 +349,15 @@ def import_apply(request:Request,jid:str,mapping_json:str=Form(...),mode:str=For
         if mode=="replace":
             for k,p in cur.items():
                 if k not in incoming:p.active=False;p.updated_at=utcnow();archived+=1
-        audit(db,u["username"],"NIRVANA_IMPORT_APPLIED",f"{job.filename}; mode={mode}; added={added}; changed={changed}; archived={archived}; parse_errors={len(errors)}");config_bump(db,u["username"],f"Nirvana import {job.filename}");db.delete(job);db.commit()
+        nav_note=""
+        report_nav=meta.get("nav_usd") if mapping.get("format")=="nirvana_exposure_by_underlying" else None
+        if report_nav:
+            old_nav=float(get_setting(db,"nav_usd","0") or 0)
+            set_setting(db,"nav_usd",float(report_nav))
+            nav_note=f"; NAV {old_nav}->{float(report_nav)}"
+        audit(db,u["username"],"NIRVANA_IMPORT_APPLIED",f"{job.filename}; mode={mode}; added={added}; changed={changed}; archived={archived}; parse_errors={len(errors)}{nav_note}")
+        config_bump(db,u["username"],f"Nirvana import {job.filename}")
+        db.delete(job);db.commit()
     return RedirectResponse("/admin",303)
 
 def collector_auth(request):
