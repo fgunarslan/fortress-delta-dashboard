@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os,json,hmac,html,uuid,re
 from datetime import datetime,timezone,date
+from zoneinfo import ZoneInfo
 from urllib.parse import quote,unquote
 from fastapi import FastAPI,Request,Form,UploadFile,File,HTTPException
 from fastapi.responses import HTMLResponse,RedirectResponse
@@ -102,6 +103,14 @@ def latest_snapshot(db):
     except Exception:age=999999
     return p,age
 
+def format_new_york_time(timestamp_utc):
+    try:
+        ts=datetime.fromisoformat(str(timestamp_utc).replace("Z","+00:00"))
+        ny=ts.astimezone(ZoneInfo("America/New_York"))
+        return ny.strftime("%d %b %Y, %H:%M:%S %Z")
+    except Exception:
+        return str(timestamp_utc or "")
+
 @app.get("/")
 def dashboard(request:Request):
     u=current_user(request)
@@ -123,7 +132,7 @@ def dashboard(request:Request):
 <div class="card metric"><div class="muted">Buffer</div><div class="v">{buf:.3f}%</div></div>
 <div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get("valid",0)}/{cov.get("total",0)}</div><div class="muted">Collector v{p.get("config_version")} / Portal v{cfg}</div></div></div>
 {('<div class="notice">A new portfolio config is published; collector has not reported it yet.</div>' if mismatch else '')}
-<div class="card"><div class="muted">Last update</div>{html.escape(p.get("timestamp_utc",""))} · Collector: {html.escape(p.get("collector_id",""))}</div>
+<div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get("timestamp_utc","")))} · Collector: {html.escape(p.get("collector_id",""))}</div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>"""
         return page("Delta Monitor",body,u,3)
 
