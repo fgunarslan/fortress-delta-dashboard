@@ -11,7 +11,7 @@ from security import ADMIN_USER,ensure_admin,hash_password,verify_password,sign_
 from helpers import option_security,detect_map,parse_upload,parse_nirvana_exposure_rows,normalized_import,keypos
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
-STALE_AFTER_SECONDS=int(os.getenv("STALE_AFTER_SECONDS","20"))
+STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
 app=FastAPI(title="Fortress Delta Dashboard v2",docs_url=None,redoc_url=None)
 
 def init_data():
@@ -119,14 +119,17 @@ def dashboard(request:Request):
         p,age=latest_snapshot(db);cfg=int(get_setting(db,"config_version","1"));limit=float(get_setting(db,"limit_pct","15"))
         if not p:
             return page("Delta Monitor",f'<div class="card"><h1>RPD Fortress Fund — Bloomberg Delta Monitor</h1><div class="notice">WAITING — No collector snapshot yet.</div><p>Published config v{cfg}</p></div>',u,5)
-        stale=age>STALE_AFTER_SECONDS;status="OFFLINE / STALE" if stale else p.get("mode","LIVE")
+        mode=p.get("mode","LIVE")
+        closed_mode=(mode=="MARKET_CLOSED")
+        stale=(age>STALE_AFTER_SECONDS) and not closed_mode
+        status="MARKET CLOSED" if closed_mode else ("OFFLINE / STALE" if stale else mode)
         pct=p.get("delta_exposure_pct",0) or 0;buf=p.get("buffer_pct",0) or 0;exp=p.get("delta_exposure_usd",0) or 0;cov=p.get("coverage",{})
         rows=""
         for r in sorted(p.get("positions",[]),key=lambda x:abs(x.get("contribution_pct",0)),reverse=True):
             rows+=f'<tr><td>{html.escape(r.get("ticker",""))} {html.escape(r.get("expiry",""))} {html.escape(r.get("option_type",""))}{r.get("strike")}</td><td>{r.get("quantity",0):,.0f}</td><td>${r.get("delta_exposure_usd",0):,.0f}</td><td>{r.get("contribution_pct",0):.3f}%</td></tr>'
         mismatch=p.get("config_version")!=cfg
         body=f"""<h1>RPD Fortress Fund — Bloomberg Delta Monitor</h1><div class="grid">
-<div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">Age {age:.1f}s</div></div>
+<div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed_mode else f'Age {age:.1f}s'}</div></div>
 <div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div>
 <div class="card metric"><div class="muted">Limit</div><div class="v">{limit:.3f}%</div></div>
 <div class="card metric"><div class="muted">Buffer</div><div class="v">{buf:.3f}%</div></div>
