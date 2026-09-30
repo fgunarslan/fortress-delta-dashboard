@@ -24,6 +24,35 @@ _quote_lock = threading.Lock()
 _quote_cache = {"ts": 0.0, "symbols": (), "data": {}, "error": ""}
 CACHE_SECONDS = 55
 
+_yfdata_obj = None
+
+def _yfinance_quote_payload(symbols):
+    """Authenticated Yahoo quote request via yfinance.
+
+    Yahoo's /v7/finance/quote endpoint now requires a matching cookie+crumb.
+    yfinance's YfData manages that session state for us, so Bid/Ask can be
+    requested in one batch without manually handling Yahoo authentication.
+    """
+    global _yfdata_obj
+    if not symbols:
+        return {}, ""
+    try:
+        from yfinance.data import YfData
+        if _yfdata_obj is None:
+            _yfdata_obj = YfData()
+        response = _yfdata_obj.get(
+            url="https://query1.finance.yahoo.com/v7/finance/quote",
+            params={"symbols": ",".join(symbols)},
+            timeout=12,
+        )
+        payload = response.json()
+        err = ((payload.get("finance") or {}).get("error") or {})
+        if err:
+            return {}, f"Yahoo: {err.get('code','Error')} — {err.get('description','')}".strip()
+        return payload, ""
+    except Exception as e:
+        return {}, f"Yahoo authenticated quote error: {e}"
+
 
 def _num(v):
     if v is None:
@@ -345,9 +374,10 @@ def _chart_quote(symbol):
 def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
     """Fetch current marks with minimal Yahoo requests.
 
-    Preferred current mark for every option/equity:
-      1. Bid and Ask both usable -> (Bid + Ask) / 2
-      2. Otherwise Yahoo regularMarketPrice / latest last price
+    Preferred current mark:
+      1. Authenticated Yahoo quote: Bid + Ask -> midpoint
+      2. If Bid/Ask are unavailable: Yahoo regularMarketPrice
+      3. If authenticated quote misses a symbol: spark/chart fallback
 
     No option-expiration discovery is used.
     """
@@ -359,29 +389,19 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
             return dict(_quote_cache["data"]), _quote_cache["error"]
 
     data = {}
-    global_err = ""
+    auth_error = ""
     wanted = set(symbols)
 
     if symbols:
-        # First choice: one batch quote request for Bid / Ask / Last.
-        quote_qs = urlencode({"symbols": ",".join(symbols)})
-        quote_rate_limited = False
+        # First choice: yfinance-authenticated one-batch quote request.
+        payload, auth_error = _yfinance_quote_payload(symbols)
+        if payload:
+            data.update(_parse_quote_batch(payload, wanted))
 
-        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-            payload, err = _http_json(f"https://{host}/v7/finance/quote?{quote_qs}")
-            if err:
-                global_err = err
-                if "429" in err or "rate limited" in err.lower():
-                    quote_rate_limited = True
-                continue
-            parsed = _parse_quote_batch(payload or {}, wanted)
-            if parsed:
-                data.update(parsed)
-                break
-
-        # For missing symbols or missing mark, use ONE spark batch as fallback.
+        # Missing mark -> one spark batch fallback.
         missing = [s for s in symbols if s not in data or data[s].get("mark") is None]
-        if missing and not quote_rate_limited:
+        fallback_error = ""
+        if missing:
             spark_qs = urlencode({
                 "symbols": ",".join(missing),
                 "range": "1d",
@@ -390,11 +410,11 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
                 "includePrePost": "false",
             })
             for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-                payload, err = _http_json(f"https://{host}/v7/finance/spark?{spark_qs}")
+                spark_payload, err = _http_json(f"https://{host}/v7/finance/spark?{spark_qs}")
                 if err:
-                    global_err = err
+                    fallback_error = err
                     continue
-                spark_data = _parse_spark(payload or {}, set(missing))
+                spark_data = _parse_spark(spark_payload or {}, set(missing))
                 for symbol, tup in spark_data.items():
                     px, src, note = tup
                     existing = data.get(symbol, {})
@@ -408,31 +428,25 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
                 if spark_data:
                     break
 
-        # Final individual chart fallback only for still-missing symbols and
-        # only when Yahoo has not already rate-limited the server.
-        if not quote_rate_limited:
-            for symbol in symbols:
-                if symbol in data and data[symbol].get("mark") is not None:
-                    continue
-                px, src, err = _chart_quote(symbol)
-                existing = data.get(symbol, {})
-                existing.update({
-                    "mark": px,
-                    "last": px if px is not None else existing.get("last"),
-                    "source": src,
-                    "note": err,
-                })
-                data[symbol] = existing
-        else:
-            for symbol in symbols:
-                existing = data.get(symbol, {})
-                if existing.get("mark") is None:
-                    existing.update({
-                        "mark": None,
-                        "source": "UNAVAILABLE",
-                        "note": global_err or "Yahoo rate limited",
-                    })
-                data[symbol] = existing
+        # Last fallback: chart endpoint for still-missing symbols.
+        for symbol in symbols:
+            if symbol in data and data[symbol].get("mark") is not None:
+                continue
+            px, src, err = _chart_quote(symbol)
+            existing = data.get(symbol, {})
+            existing.update({
+                "mark": px,
+                "last": px if px is not None else existing.get("last"),
+                "source": src,
+                "note": err,
+            })
+            data[symbol] = existing
+
+        # Only display a Yahoo warning if coverage is still incomplete.
+        incomplete = any(data.get(s, {}).get("mark") is None for s in symbols)
+        global_err = (auth_error or fallback_error) if incomplete else ""
+    else:
+        global_err = ""
 
     with _quote_lock:
         _quote_cache.update({
