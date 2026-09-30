@@ -6,10 +6,10 @@ from urllib.parse import quote,unquote
 from fastapi import FastAPI,Request,Form,UploadFile,File,HTTPException
 from fastapi.responses import HTMLResponse,RedirectResponse
 
-from db import SessionLocal,User,Setting,Position,Audit,Snapshot,ImportJob,DailyReturnBaseline,DailyReturnPosition,get_setting,set_setting,audit,config_bump,utcnow
+from db import SessionLocal,User,Setting,Position,Audit,Snapshot,ImportJob,DailyReturnBaseline,DailyReturnPosition,DailyReturnExposureBaseline,DailyReturnExposurePosition,get_setting,set_setting,audit,config_bump,utcnow
 from security import ADMIN_USER,ensure_admin,hash_password,verify_password,sign_session,read_session
 from helpers import option_security,detect_map,parse_upload,parse_nirvana_exposure_rows,normalized_import,keypos
-from daily_return import parse_nirvana_pnl_pdf,calculate_estimated_return,auto_refresh_allowed,ny_time_label
+from daily_return import parse_nirvana_pnl_pdf,parse_nirvana_exposure_xlsx,calculate_delta_estimated_return,auto_refresh_allowed,ny_time_label
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
@@ -377,6 +377,9 @@ def import_apply(request:Request,jid:str,mapping_json:str=Form(...),mode:str=For
 def _active_daily_baseline(db):
     return db.query(DailyReturnBaseline).filter_by(active=True).order_by(DailyReturnBaseline.id.desc()).first()
 
+def _matching_daily_exposure_baseline(db,report_date):
+    return db.query(DailyReturnExposureBaseline).filter_by(report_date=report_date).order_by(DailyReturnExposureBaseline.id.desc()).first()
+
 @app.get("/daily-return")
 def daily_return_page(request:Request):
     u=require_user(request)
@@ -385,16 +388,30 @@ def daily_return_page(request:Request):
         if not b:
             extra=' <a href="/admin/daily-return">Upload P&amp;L Report</a>' if u["username"]==ADMIN_USER else ''
             return page("Estimated Daily Return",f'<h1>Estimated Daily Return</h1><div class="card"><div class="notice">No P&amp;L baseline has been uploaded yet.{extra}</div></div>',u)
+        eb=_matching_daily_exposure_baseline(db,b.report_date)
+        if not eb:
+            extra=' <a href="/admin/daily-return">Upload matching Exposure by Underlying XLSX</a>' if u["username"]==ADMIN_USER else ''
+            body=f'''<h1>RPD Fortress Fund — Estimated Daily Return</h1>
+<div class="card"><div class="notice"><strong>WAITING FOR EXPOSURE BASELINE</strong><br>The active P&amp;L report is dated {html.escape(b.report_date)}. Upload the same day's Nirvana <strong>Exposure by Underlying</strong> XLSX in Daily Return Upload.{extra}</div></div>
+<div class="card"><strong>P&amp;L baseline:</strong> {html.escape(b.filename)} · NAV ${b.nav_usd:,.2f}</div>'''
+            return page("Estimated Daily Return",body,u)
+
         dbpos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.ticker,DailyReturnPosition.expiry,DailyReturnPosition.strike).all()
+        exppos=db.query(DailyReturnExposurePosition).filter_by(baseline_id=eb.id).order_by(DailyReturnExposurePosition.ticker,DailyReturnExposurePosition.expiry,DailyReturnExposurePosition.strike).all()
         positions=[{
             "id":p.id,"security_name":p.security_name,"instrument_type":p.instrument_type,"ticker":p.ticker,
             "expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,
             "multiplier":p.multiplier,"baseline_price":p.baseline_price,"baseline_market_value":p.baseline_market_value,
-            "manual_price":p.manual_price,
         } for p in dbpos]
+        exposures=[{
+            "ticker":p.ticker,"expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,
+            "delta":p.delta,"delta_adjusted_position":p.delta_adjusted_position,"net_exposure":p.net_exposure,
+            "net_exposure_pct":p.net_exposure_pct,"baseline_underlying_price":p.baseline_underlying_price,
+        } for p in exppos]
         baseline={"report_date":b.report_date,"run_date":b.run_date,"filename":b.filename,"nav_usd":b.nav_usd}
+        exposure_meta={"filename":eb.filename,"nav_usd":eb.nav_usd}
 
-    calc=calculate_estimated_return(positions,float(baseline["nav_usd"]))
+    calc=calculate_delta_estimated_return(positions,exposures,float(baseline["nav_usd"]))
     status="FULL" if calc["complete"] else "PARTIAL"
     ret=calc["estimated_return_pct"] or 0.0
     pnl=calc["estimated_pnl"] or 0.0
@@ -402,27 +419,31 @@ def daily_return_page(request:Request):
     for r in sorted(calc["rows"],key=lambda x:abs(x.get("estimated_pnl") or 0),reverse=True):
         strike="" if r.get("strike") is None else f'{r["strike"]:g}'
         posname=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"])
-        cur='—' if r.get("current_mark") is None else f'${r["current_mark"]:,.3f}'
-        epnl='—' if r.get("estimated_pnl") is None else f'${r["estimated_pnl"]:,.0f}'
-        contrib='—' if r.get("contribution_pct") is None else f'{r["contribution_pct"]:.3f}%'
+        delta='—' if r.get("nirvana_delta") is None else f'{r["nirvana_delta"]:.4f}'
+        dap='—' if r.get("delta_adjusted_position") is None else f'{r["delta_adjusted_position"]:,.0f}'
+        base_spot='—' if r.get("baseline_underlying_price") is None else f'${r["baseline_underlying_price"]:,.4f}'
+        cur_spot='—' if r.get("current_underlying_price") is None else f'${r["current_underlying_price"]:,.4f}'
+        epnl='—' if r.get("estimated_pnl") is None else f'${r["estimated_pnl"]:+,.0f}'
+        contrib='—' if r.get("contribution_pct") is None else f'{r["contribution_pct"]:+.3f}%'
         note=(r.get("price_source") or "")
-        if r.get("note"):
-            note+=f' · {r["note"]}'
-        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>${(r.get("baseline_price") or 0):,.3f}</td><td>{cur}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(note)}</td></tr>'
+        if r.get("note"): note+=f' · {r["note"]}'
+        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>{delta}</td><td>{dap}</td><td>{base_spot}</td><td>{cur_spot}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(note)}</td></tr>'
 
-    warning="" if calc["complete"] else '<div class="notice"><strong>PARTIAL estimate:</strong> one or more positions do not have a usable Yahoo/manual price. The displayed return includes covered positions only.</div><br>'
+    warning="" if calc["complete"] else '<div class="notice"><strong>PARTIAL estimate:</strong> one or more positions are missing a same-date Nirvana delta baseline or a usable Yahoo underlying price. Only covered positions are included.</div><br>'
+    if calc.get("yahoo_error"):
+        warning+=f'<div class="notice"><strong>Yahoo:</strong> {html.escape(calc["yahoo_error"])}</div><br>'
     quality_class='ok' if calc['complete'] else 'bad'
     body=f'''<h1>RPD Fortress Fund — Estimated Daily Return</h1>
 <div class="grid">
-<div class="card metric"><div class="muted">Status</div><div class="v {quality_class}">{status}</div><div class="muted">Yahoo / manual marks</div></div>
+<div class="card metric"><div class="muted">Status</div><div class="v {quality_class}">{status}</div><div class="muted">Delta-based estimate</div></div>
 <div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.3f}%</div></div>
 <div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.0f}</div></div>
 <div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${baseline['nav_usd']:,.0f}</div><div class="muted">Report {html.escape(baseline['report_date'])}</div></div>
-<div class="card metric"><div class="muted">Price Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo may be delayed</div></div>
+<div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo underlyings {calc['ticker_coverage_valid']}/{calc['ticker_coverage_total']}</div></div>
 </div>
 {warning}
-<div class="card"><div class="muted">Baseline</div><strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · Run Date {html.escape(baseline['run_date'])}<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. During the normal NY session this page refreshes every 60 seconds. This is an estimate, not official NAV.</div></div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Current Mark</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Price Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><div class="muted">Daily Return baselines — completely separate from Bloomberg</div><strong>P&amp;L:</strong> {html.escape(baseline['filename'])} · <strong>Exposure:</strong> {html.escape(exposure_meta['filename'])} · Report Date {html.escape(baseline['report_date'])}<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Yahoo is used only for the underlying stock prices. Estimate = prior-close Nirvana Delta Adjusted Position × underlying price move. It is not official NAV and does not capture gamma, vega, theta, intraday trades or changing delta.</div></div>
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Nirvana Delta</th><th>Delta Adj. Position</th><th>Baseline Underlying</th><th>Yahoo Current</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Estimated Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/admin/daily-return")
@@ -430,20 +451,38 @@ def daily_return_admin(request:Request):
     u=require_admin(request)
     with SessionLocal() as db:
         b=_active_daily_baseline(db)
-        current="<p>No baseline loaded.</p>"
-        rows=""
+        pnl_current="<p>No P&amp;L baseline loaded.</p>"
+        exp_current="<p>No Daily Return Exposure baseline loaded.</p>"
+        match_note=""
         if b:
             pos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.ticker,DailyReturnPosition.expiry,DailyReturnPosition.strike).all()
-            for p in pos:
-                strike="" if p.strike is None else f'{p.strike:g}'
-                name=f'{p.ticker} {p.expiry} {p.option_type}{strike}' if p.instrument_type=="OPTION" else p.ticker
-                override="" if p.manual_price is None else f'{p.manual_price:g}'
-                rows+=f'<tr><td>{html.escape(name)}</td><td>{p.quantity:,.0f}</td><td>${(p.baseline_price or 0):,.4f}</td><td>${p.baseline_market_value:,.0f}</td><td><form method="post" action="/admin/daily-return/position/{p.id}/override" style="display:inline"><input name="price" value="{html.escape(override)}" placeholder="optional" size="8"><button>Save</button></form></td></tr>'
-            current=f'''<div class="notice"><strong>Active baseline:</strong> {html.escape(b.filename)} · Report {html.escape(b.report_date)} · NAV ${b.nav_usd:,.2f} · Positions {len(pos)}</div><br><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark*</th><th>Previous Market Value</th><th>Manual Current Price Override</th></tr></thead><tbody>{rows}</tbody></table><p class="muted">*Previous Mark is inferred from signed Market Value ÷ Quantity ÷ multiplier when possible, avoiding rounded PDF display prices.</p>'''
-    body=admin_tabs()+f'''<div class="card"><h2>Daily Return — P&amp;L Baseline Upload</h2>
-<p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. This creates a completely separate daily-return baseline and does <strong>not</strong> modify Bloomberg positions, Bloomberg snapshots, portal NAV, delta limits or collector settings.</p>
-<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload &amp; Use as Daily Return Baseline</button></form></div>
-<div class="card"><h3>Current Daily Return Baseline</h3>{current}</div>'''
+            pnl_current=f'<div class="notice"><strong>P&amp;L baseline:</strong> {html.escape(b.filename)} · Report {html.escape(b.report_date)} · NAV ${b.nav_usd:,.2f} · Positions {len(pos)}</div>'
+            eb=_matching_daily_exposure_baseline(db,b.report_date)
+            if eb:
+                exps=db.query(DailyReturnExposurePosition).filter_by(baseline_id=eb.id).order_by(DailyReturnExposurePosition.ticker,DailyReturnExposurePosition.expiry,DailyReturnExposurePosition.strike).all()
+                erows=""
+                for p in exps:
+                    erows+=f'<tr><td>{html.escape(f"{p.ticker} {p.expiry} {p.option_type}{p.strike:g}")}</td><td>{p.delta:.4f}</td><td>{p.delta_adjusted_position:,.0f}</td><td>${p.baseline_underlying_price:,.4f}</td></tr>'
+                exp_current=f'''<div class="notice"><strong>Matching Exposure baseline:</strong> {html.escape(eb.filename)} · Report {html.escape(eb.report_date)} · Positions {len(exps)}</div><br><table><thead><tr><th>Position</th><th>Delta</th><th>Delta Adj. Position</th><th>Baseline Underlying</th></tr></thead><tbody>{erows}</tbody></table>'''
+                match_note='<div class="notice"><strong>READY:</strong> P&amp;L and Exposure baselines have the same report date. Daily Return can calculate.</div><br>'
+            else:
+                latest=db.query(DailyReturnExposureBaseline).order_by(DailyReturnExposureBaseline.id.desc()).first()
+                if latest:
+                    exp_current=f'<div class="notice"><strong>Latest Exposure upload:</strong> {html.escape(latest.filename)} · Report {html.escape(latest.report_date)}. It does not match the active P&amp;L date {html.escape(b.report_date)}.</div>'
+                match_note='<div class="notice"><strong>NOT READY:</strong> Upload the Exposure by Underlying XLSX for the same date as the active P&amp;L report.</div><br>'
+        else:
+            latest=db.query(DailyReturnExposureBaseline).order_by(DailyReturnExposureBaseline.id.desc()).first()
+            if latest:
+                exp_current=f'<div class="notice"><strong>Latest Exposure upload:</strong> {html.escape(latest.filename)} · Report {html.escape(latest.report_date)}</div>'
+
+    body=admin_tabs()+f'''{match_note}
+<div class="card"><h2>Daily Return — 1) P&amp;L Baseline</h2>
+<p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. This is stored only in the Daily Return module.</p>
+<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload P&amp;L Baseline</button></form><br>{pnl_current}</div>
+<div class="card"><h2>Daily Return — 2) Delta Exposure Baseline</h2>
+<p>Upload the <strong>same day's Nirvana Exposure by Underlying XLSX</strong>. This upload is for Daily Return only. It does <strong>not</strong> change Bloomberg positions, portal NAV, config version, collector settings, Bloomberg snapshots, limit, admin/viewer users or the Collector.</p>
+<form method="post" action="/admin/daily-return/exposure-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Exposure Baseline</button></form><br>{exp_current}</div>
+<div class="card"><h3>Calculation Method</h3><p>Yahoo Finance supplies only the current <strong>underlying stock price</strong>. No Yahoo option-chain request is made. For options, the estimate uses the prior-close Nirvana Delta Adjusted Position and the underlying price move. This is a first-order intraday estimate, not official NAV.</p></div>'''
     return page("Daily Return Upload",body,u)
 
 @app.post("/admin/daily-return/upload")
@@ -460,44 +499,45 @@ async def daily_return_upload(request:Request,file:UploadFile=File(...)):
     except Exception as e:
         raise HTTPException(400,f"Could not parse PNL Report: {e}")
     with SessionLocal() as db:
-        for old in db.query(DailyReturnBaseline).filter_by(active=True).all():
-            old.active=False
+        for old in db.query(DailyReturnBaseline).filter_by(active=True).all(): old.active=False
         b=DailyReturnBaseline(report_date=parsed["report_date"],run_date=parsed["run_date"],filename=filename,
                               nav_usd=parsed["nav_usd"],active=True,uploaded_by=u["username"])
-        db.add(b)
-        db.flush()
+        db.add(b);db.flush()
         for x in parsed["positions"]:
             db.add(DailyReturnPosition(
                 baseline_id=b.id,security_name=x["security_name"],instrument_type=x["instrument_type"],ticker=x["ticker"],
                 expiry=x.get("expiry","") or "",option_type=x.get("option_type","") or "",strike=x.get("strike"),
                 quantity=x["quantity"],multiplier=x["multiplier"],baseline_price=x.get("baseline_price"),
                 baseline_market_value=x["baseline_market_value"],manual_price=None))
-        audit(db,u["username"],"DAILY_RETURN_BASELINE_UPLOADED",
+        audit(db,u["username"],"DAILY_RETURN_PNL_BASELINE_UPLOADED",
               f'{filename}; report_date={parsed["report_date"]}; nav={parsed["nav_usd"]}; positions={len(parsed["positions"])}')
         db.commit()
     return RedirectResponse("/admin/daily-return",303)
 
-@app.post("/admin/daily-return/position/{pid}/override")
-def daily_return_override(request:Request,pid:int,price:str=Form("")):
+@app.post("/admin/daily-return/exposure-upload")
+async def daily_return_exposure_upload(request:Request,file:UploadFile=File(...)):
     u=require_admin(request)
+    filename=file.filename or "Exposure.xlsx"
+    if not filename.lower().endswith((".xlsx",".xlsm")):
+        raise HTTPException(400,"Please upload the Nirvana Exposure by Underlying XLSX.")
+    data=await file.read()
+    if len(data)>12*1024*1024:
+        raise HTTPException(400,"XLSX is too large.")
+    try:
+        parsed=parse_nirvana_exposure_xlsx(data)
+    except Exception as e:
+        raise HTTPException(400,f"Could not parse Exposure report: {e}")
     with SessionLocal() as db:
-        p=db.get(DailyReturnPosition,pid)
-        if not p:
-            raise HTTPException(404)
-        raw=price.strip()
-        if raw=="":
-            p.manual_price=None
-            detail="cleared"
-        else:
-            try:
-                v=float(raw.replace(",",""))
-            except Exception:
-                raise HTTPException(400,"Invalid price")
-            if v<=0:
-                raise HTTPException(400,"Price must be greater than zero")
-            p.manual_price=v
-            detail=f"{v}"
-        audit(db,u["username"],"DAILY_RETURN_PRICE_OVERRIDE",f"position_id={pid}; price={detail}")
+        eb=DailyReturnExposureBaseline(report_date=parsed["report_date"],filename=filename,nav_usd=parsed.get("nav_usd"),uploaded_by=u["username"])
+        db.add(eb);db.flush()
+        for x in parsed["positions"]:
+            db.add(DailyReturnExposurePosition(
+                baseline_id=eb.id,ticker=x["ticker"],expiry=x["expiry"],option_type=x["option_type"],strike=x["strike"],
+                quantity=x["quantity"],delta=x["delta"],delta_adjusted_position=x["delta_adjusted_position"],
+                net_exposure=x["net_exposure"],net_exposure_pct=x.get("net_exposure_pct"),
+                baseline_underlying_price=x["baseline_underlying_price"]))
+        audit(db,u["username"],"DAILY_RETURN_EXPOSURE_BASELINE_UPLOADED",
+              f'{filename}; report_date={parsed["report_date"]}; positions={len(parsed["positions"])}')
         db.commit()
     return RedirectResponse("/admin/daily-return",303)
 

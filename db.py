@@ -98,6 +98,31 @@ class DailyReturnPosition(Base):
     manual_price=Column(Float,nullable=True)
     created_at=Column(DateTime(timezone=True),default=utcnow)
 
+class DailyReturnExposureBaseline(Base):
+    __tablename__="daily_return_exposure_baselines"
+    id=Column(Integer,primary_key=True)
+    report_date=Column(String(10),nullable=False,index=True)
+    filename=Column(String(255),nullable=False)
+    nav_usd=Column(Float,nullable=True)
+    uploaded_by=Column(String(80),nullable=False)
+    created_at=Column(DateTime(timezone=True),default=utcnow,index=True)
+
+class DailyReturnExposurePosition(Base):
+    __tablename__="daily_return_exposure_positions"
+    id=Column(Integer,primary_key=True)
+    baseline_id=Column(Integer,nullable=False,index=True)
+    ticker=Column(String(30),nullable=False,index=True)
+    expiry=Column(String(10),nullable=False)
+    option_type=Column(String(1),nullable=False)
+    strike=Column(Float,nullable=False)
+    quantity=Column(Float,nullable=False)
+    delta=Column(Float,nullable=False)
+    delta_adjusted_position=Column(Float,nullable=False)
+    net_exposure=Column(Float,nullable=False)
+    net_exposure_pct=Column(Float,nullable=True)
+    baseline_underlying_price=Column(Float,nullable=False)
+    created_at=Column(DateTime(timezone=True),default=utcnow)
+
 Base.metadata.create_all(engine)
 
 def get_setting(db,key,default=None):
