@@ -6,9 +6,10 @@ from urllib.parse import quote,unquote
 from fastapi import FastAPI,Request,Form,UploadFile,File,HTTPException
 from fastapi.responses import HTMLResponse,RedirectResponse
 
-from db import SessionLocal,User,Setting,Position,Audit,Snapshot,ImportJob,get_setting,set_setting,audit,config_bump,utcnow
+from db import SessionLocal,User,Setting,Position,Audit,Snapshot,ImportJob,DailyReturnBaseline,DailyReturnPosition,get_setting,set_setting,audit,config_bump,utcnow
 from security import ADMIN_USER,ensure_admin,hash_password,verify_password,sign_session,read_session
 from helpers import option_security,detect_map,parse_upload,parse_nirvana_exposure_rows,normalized_import,keypos
+from daily_return import parse_nirvana_pnl_pdf,calculate_estimated_return,auto_refresh_allowed,ny_time_label
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
@@ -52,7 +53,8 @@ def require_admin(request):
 
 def page(title,body,user=None,refresh=None):
     adminlink='<a href="/admin">Admin</a>' if user and user["username"]==ADMIN_USER else ""
-    auth=f'<span>{html.escape(user["username"])}</span> {adminlink} <a href="/logout">Logout</a>' if user else ""
+    daily='<a href="/daily-return">Daily Return</a>' if user else ""
+    auth=f'<span>{html.escape(user["username"])}</span> {daily} {adminlink} <a href="/logout">Logout</a>' if user else ""
     rf=f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">{rf}<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title><style>
@@ -67,7 +69,7 @@ input,select,button{{padding:8px;border:1px solid #c9d3e1;border-radius:7px}}but
 </style></head><body><div class="wrap"><nav><strong><a class="brand" href="/">Fortress Delta Monitor</a></strong><div>{auth}</div></nav>{body}</div></body></html>""")
 
 def admin_tabs():
-    return '<p><a href="/">Dashboard</a> · <a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
+    return '<p><a href="/">Dashboard</a> · <a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/daily-return">Daily Return Upload</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
 
 @app.get("/health")
 def health():return {"ok":True}
@@ -371,6 +373,133 @@ def import_apply(request:Request,jid:str,mapping_json:str=Form(...),mode:str=For
         config_bump(db,u["username"],f"Nirvana import {job.filename}")
         db.delete(job);db.commit()
     return RedirectResponse("/admin",303)
+
+def _active_daily_baseline(db):
+    return db.query(DailyReturnBaseline).filter_by(active=True).order_by(DailyReturnBaseline.id.desc()).first()
+
+@app.get("/daily-return")
+def daily_return_page(request:Request):
+    u=require_user(request)
+    with SessionLocal() as db:
+        b=_active_daily_baseline(db)
+        if not b:
+            extra=' <a href="/admin/daily-return">Upload P&amp;L Report</a>' if u["username"]==ADMIN_USER else ''
+            return page("Estimated Daily Return",f'<h1>Estimated Daily Return</h1><div class="card"><div class="notice">No P&amp;L baseline has been uploaded yet.{extra}</div></div>',u)
+        dbpos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.ticker,DailyReturnPosition.expiry,DailyReturnPosition.strike).all()
+        positions=[{
+            "id":p.id,"security_name":p.security_name,"instrument_type":p.instrument_type,"ticker":p.ticker,
+            "expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,
+            "multiplier":p.multiplier,"baseline_price":p.baseline_price,"baseline_market_value":p.baseline_market_value,
+            "manual_price":p.manual_price,
+        } for p in dbpos]
+        baseline={"report_date":b.report_date,"run_date":b.run_date,"filename":b.filename,"nav_usd":b.nav_usd}
+
+    calc=calculate_estimated_return(positions,float(baseline["nav_usd"]))
+    status="FULL" if calc["complete"] else "PARTIAL"
+    ret=calc["estimated_return_pct"] or 0.0
+    pnl=calc["estimated_pnl"] or 0.0
+    rows=""
+    for r in sorted(calc["rows"],key=lambda x:abs(x.get("estimated_pnl") or 0),reverse=True):
+        strike="" if r.get("strike") is None else f'{r["strike"]:g}'
+        posname=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"])
+        cur='—' if r.get("current_mark") is None else f'${r["current_mark"]:,.3f}'
+        epnl='—' if r.get("estimated_pnl") is None else f'${r["estimated_pnl"]:,.0f}'
+        contrib='—' if r.get("contribution_pct") is None else f'{r["contribution_pct"]:.3f}%'
+        note=(r.get("price_source") or "")
+        if r.get("note"):
+            note+=f' · {r["note"]}'
+        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>${(r.get("baseline_price") or 0):,.3f}</td><td>{cur}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(note)}</td></tr>'
+
+    warning="" if calc["complete"] else '<div class="notice"><strong>PARTIAL estimate:</strong> one or more positions do not have a usable Yahoo/manual price. The displayed return includes covered positions only.</div><br>'
+    quality_class='ok' if calc['complete'] else 'bad'
+    body=f'''<h1>RPD Fortress Fund — Estimated Daily Return</h1>
+<div class="grid">
+<div class="card metric"><div class="muted">Status</div><div class="v {quality_class}">{status}</div><div class="muted">Yahoo / manual marks</div></div>
+<div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.3f}%</div></div>
+<div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.0f}</div></div>
+<div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${baseline['nav_usd']:,.0f}</div><div class="muted">Report {html.escape(baseline['report_date'])}</div></div>
+<div class="card metric"><div class="muted">Price Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo may be delayed</div></div>
+</div>
+{warning}
+<div class="card"><div class="muted">Baseline</div><strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · Run Date {html.escape(baseline['run_date'])}<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. During the normal NY session this page refreshes every 60 seconds. This is an estimate, not official NAV.</div></div>
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Current Mark</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Price Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    return page("Estimated Daily Return",body,u,60 if auto_refresh_allowed() else None)
+
+@app.get("/admin/daily-return")
+def daily_return_admin(request:Request):
+    u=require_admin(request)
+    with SessionLocal() as db:
+        b=_active_daily_baseline(db)
+        current="<p>No baseline loaded.</p>"
+        rows=""
+        if b:
+            pos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.ticker,DailyReturnPosition.expiry,DailyReturnPosition.strike).all()
+            for p in pos:
+                strike="" if p.strike is None else f'{p.strike:g}'
+                name=f'{p.ticker} {p.expiry} {p.option_type}{strike}' if p.instrument_type=="OPTION" else p.ticker
+                override="" if p.manual_price is None else f'{p.manual_price:g}'
+                rows+=f'<tr><td>{html.escape(name)}</td><td>{p.quantity:,.0f}</td><td>${(p.baseline_price or 0):,.4f}</td><td>${p.baseline_market_value:,.0f}</td><td><form method="post" action="/admin/daily-return/position/{p.id}/override" style="display:inline"><input name="price" value="{html.escape(override)}" placeholder="optional" size="8"><button>Save</button></form></td></tr>'
+            current=f'''<div class="notice"><strong>Active baseline:</strong> {html.escape(b.filename)} · Report {html.escape(b.report_date)} · NAV ${b.nav_usd:,.2f} · Positions {len(pos)}</div><br><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark*</th><th>Previous Market Value</th><th>Manual Current Price Override</th></tr></thead><tbody>{rows}</tbody></table><p class="muted">*Previous Mark is inferred from signed Market Value ÷ Quantity ÷ multiplier when possible, avoiding rounded PDF display prices.</p>'''
+    body=admin_tabs()+f'''<div class="card"><h2>Daily Return — P&amp;L Baseline Upload</h2>
+<p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. This creates a completely separate daily-return baseline and does <strong>not</strong> modify Bloomberg positions, Bloomberg snapshots, portal NAV, delta limits or collector settings.</p>
+<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload &amp; Use as Daily Return Baseline</button></form></div>
+<div class="card"><h3>Current Daily Return Baseline</h3>{current}</div>'''
+    return page("Daily Return Upload",body,u)
+
+@app.post("/admin/daily-return/upload")
+async def daily_return_upload(request:Request,file:UploadFile=File(...)):
+    u=require_admin(request)
+    filename=file.filename or "PNL.pdf"
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(400,"Please upload the Nirvana PNL Report as PDF.")
+    data=await file.read()
+    if len(data)>8*1024*1024:
+        raise HTTPException(400,"PDF is too large.")
+    try:
+        parsed=parse_nirvana_pnl_pdf(data)
+    except Exception as e:
+        raise HTTPException(400,f"Could not parse PNL Report: {e}")
+    with SessionLocal() as db:
+        for old in db.query(DailyReturnBaseline).filter_by(active=True).all():
+            old.active=False
+        b=DailyReturnBaseline(report_date=parsed["report_date"],run_date=parsed["run_date"],filename=filename,
+                              nav_usd=parsed["nav_usd"],active=True,uploaded_by=u["username"])
+        db.add(b)
+        db.flush()
+        for x in parsed["positions"]:
+            db.add(DailyReturnPosition(
+                baseline_id=b.id,security_name=x["security_name"],instrument_type=x["instrument_type"],ticker=x["ticker"],
+                expiry=x.get("expiry","") or "",option_type=x.get("option_type","") or "",strike=x.get("strike"),
+                quantity=x["quantity"],multiplier=x["multiplier"],baseline_price=x.get("baseline_price"),
+                baseline_market_value=x["baseline_market_value"],manual_price=None))
+        audit(db,u["username"],"DAILY_RETURN_BASELINE_UPLOADED",
+              f'{filename}; report_date={parsed["report_date"]}; nav={parsed["nav_usd"]}; positions={len(parsed["positions"])}')
+        db.commit()
+    return RedirectResponse("/admin/daily-return",303)
+
+@app.post("/admin/daily-return/position/{pid}/override")
+def daily_return_override(request:Request,pid:int,price:str=Form("")):
+    u=require_admin(request)
+    with SessionLocal() as db:
+        p=db.get(DailyReturnPosition,pid)
+        if not p:
+            raise HTTPException(404)
+        raw=price.strip()
+        if raw=="":
+            p.manual_price=None
+            detail="cleared"
+        else:
+            try:
+                v=float(raw.replace(",",""))
+            except Exception:
+                raise HTTPException(400,"Invalid price")
+            if v<=0:
+                raise HTTPException(400,"Price must be greater than zero")
+            p.manual_price=v
+            detail=f"{v}"
+        audit(db,u["username"],"DAILY_RETURN_PRICE_OVERRIDE",f"position_id={pid}; price={detail}")
+        db.commit()
+    return RedirectResponse("/admin/daily-return",303)
 
 def collector_auth(request):
     if not COLLECTOR_TOKEN or not hmac.compare_digest(request.headers.get("authorization",""),f"Bearer {COLLECTOR_TOKEN}"):

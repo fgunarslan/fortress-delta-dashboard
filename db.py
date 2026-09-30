@@ -70,6 +70,34 @@ class ImportJob(Base):
     headers_json=Column(Text,nullable=False)
     rows_json=Column(Text,nullable=False)
 
+class DailyReturnBaseline(Base):
+    __tablename__="daily_return_baselines"
+    id=Column(Integer,primary_key=True)
+    report_date=Column(String(10),nullable=False,index=True)
+    run_date=Column(String(80),default="")
+    filename=Column(String(255),nullable=False)
+    nav_usd=Column(Float,nullable=False)
+    active=Column(Boolean,default=True,nullable=False,index=True)
+    uploaded_by=Column(String(80),nullable=False)
+    created_at=Column(DateTime(timezone=True),default=utcnow,index=True)
+
+class DailyReturnPosition(Base):
+    __tablename__="daily_return_positions"
+    id=Column(Integer,primary_key=True)
+    baseline_id=Column(Integer,nullable=False,index=True)
+    security_name=Column(String(180),nullable=False)
+    instrument_type=Column(String(20),nullable=False)
+    ticker=Column(String(30),nullable=False,index=True)
+    expiry=Column(String(10),default="")
+    option_type=Column(String(1),default="")
+    strike=Column(Float,nullable=True)
+    quantity=Column(Float,nullable=False)
+    multiplier=Column(Float,nullable=False,default=100)
+    baseline_price=Column(Float,nullable=True)
+    baseline_market_value=Column(Float,nullable=False)
+    manual_price=Column(Float,nullable=True)
+    created_at=Column(DateTime(timezone=True),default=utcnow)
+
 Base.metadata.create_all(engine)
 
 def get_setting(db,key,default=None):
