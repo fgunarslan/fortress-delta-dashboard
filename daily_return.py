@@ -12,10 +12,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
-from openpyxl import load_workbook
 from pypdf import PdfReader
-
-from helpers import parse_date, parse_nirvana_option_symbol
 
 NY = ZoneInfo("America/New_York")
 OPTION_RE = re.compile(
@@ -23,8 +20,8 @@ OPTION_RE = re.compile(
     re.I,
 )
 
-_spot_lock = threading.Lock()
-_spot_cache = {"ts": 0.0, "symbols": (), "data": {}, "error": ""}
+_quote_lock = threading.Lock()
+_quote_cache = {"ts": 0.0, "symbols": (), "data": {}, "error": ""}
 CACHE_SECONDS = 55
 
 
@@ -94,7 +91,13 @@ def _cell(line: str, col_slices, name: str) -> str:
 
 
 def parse_nirvana_pnl_pdf(data: bytes) -> dict:
-    """Parse Nirvana PNL PDF as the previous-close fund/NAV baseline."""
+    """Parse one Nirvana PNL Report PDF.
+
+    Baseline:
+      Previous Mark = PDF Price column exactly.
+      Quantity = PDF Quantity.
+      NAV = PDF Grand Total.
+    """
     text = _extract_layout_text(data)
     lines = text.splitlines()
     if not any("PNL Report" in x for x in lines[:20]):
@@ -117,33 +120,33 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
             break
     if header_idx is None:
         raise ValueError("Could not locate the PNL table header.")
-    cols = _column_slices(lines[header_idx])
 
+    cols = _column_slices(lines[header_idx])
     positions = []
     nav = None
     ignored = []
+
     for line in lines[header_idx + 1:]:
         if not line.strip():
             continue
         name = _cell(line, cols, "Security Name")
         if not name or name.startswith("Page "):
             continue
+
         if name.startswith("Grand Total"):
             gm = re.search(r"Grand Total\s*:\s*([0-9,]+(?:\.[0-9]+)?)", line, re.I)
             nav = _num(gm.group(1)) if gm else _num(_cell(line, cols, "Market Value"))
             continue
-        if name.upper() == "CLOSED":
+
+        upper = name.upper().strip()
+        if upper in {"CLOSED", "FGTXX", "USD", "CASH"}:
             continue
 
         price = _num(_cell(line, cols, "Price"))
         qty = _num(_cell(line, cols, "Quantity"))
         market_value = _num(_cell(line, cols, "Market Value"))
-        if qty is None or market_value is None:
+        if qty is None or price is None:
             ignored.append(name)
-            continue
-
-        upper = name.upper().strip()
-        if upper in {"FGTXX", "USD", "CASH"}:
             continue
 
         om = OPTION_RE.match(upper)
@@ -151,10 +154,6 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
             expiry = datetime.strptime(om.group("expiry"), "%m/%d/%y").date().isoformat()
             typ = "P" if om.group("type").upper() == "PUT" else "C"
             strike = float(om.group("strike"))
-            multiplier = 100.0
-            baseline_mark = (market_value / (qty * multiplier)) if qty else price
-            if baseline_mark is None or baseline_mark <= 0:
-                baseline_mark = price
             positions.append({
                 "security_name": name.strip(),
                 "instrument_type": "OPTION",
@@ -162,18 +161,16 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
                 "expiry": expiry,
                 "option_type": typ,
                 "strike": strike,
-                "quantity": qty,
-                "multiplier": multiplier,
-                "baseline_price": baseline_mark,
-                "display_price": price,
-                "baseline_market_value": market_value,
+                "quantity": float(qty),
+                "multiplier": 100.0,
+                "baseline_price": float(price),
+                "display_price": float(price),
+                "baseline_market_value": float(market_value or (price * qty * 100.0)),
             })
             continue
 
         ticker = upper.split()[0]
         if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", ticker):
-            multiplier = 1.0
-            baseline_mark = (market_value / qty) if qty else price
             positions.append({
                 "security_name": name.strip(),
                 "instrument_type": "EQUITY",
@@ -181,11 +178,11 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
                 "expiry": "",
                 "option_type": "",
                 "strike": None,
-                "quantity": qty,
-                "multiplier": multiplier,
-                "baseline_price": baseline_mark,
-                "display_price": price,
-                "baseline_market_value": market_value,
+                "quantity": float(qty),
+                "multiplier": 1.0,
+                "baseline_price": float(price),
+                "display_price": float(price),
+                "baseline_market_value": float(market_value or (price * qty)),
             })
         else:
             ignored.append(name)
@@ -204,81 +201,18 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
     }
 
 
-def _norm_header(v):
-    return re.sub(r"[^a-z0-9]+", " ", str(v or "").strip().lower()).strip()
+def yahoo_option_symbol(ticker: str, expiry: str, option_type: str, strike: float) -> str:
+    dt = datetime.strptime(expiry, "%Y-%m-%d")
+    root = str(ticker).upper().replace(".", "-").strip()
+    cp = str(option_type).upper()[:1]
+    strike_code = int(round(float(strike) * 1000.0))
+    return f"{root}{dt.strftime('%y%m%d')}{cp}{strike_code:08d}"
 
 
-def parse_nirvana_exposure_xlsx(data: bytes) -> dict:
-    """Parse Nirvana Exposure by Underlying XLSX for Daily Return only."""
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    ws = wb.active
-    vals = list(ws.iter_rows(values_only=True))
-    if not vals:
-        raise ValueError("Exposure workbook is empty.")
-
-    header_idx = None
-    for i, row in enumerate(vals[:30]):
-        n = {_norm_header(x) for x in row if x is not None}
-        if {"symbol", "expiration date", "position", "delta", "delta adjusted position", "net exposure"}.issubset(n):
-            header_idx = i
-            break
-    if header_idx is None:
-        raise ValueError("Could not locate the Nirvana Exposure Summary header.")
-
-    headers = [str(x).strip() if x is not None else "" for x in vals[header_idx]]
-    idx = {_norm_header(h): i for i, h in enumerate(headers)}
-    required = ["symbol", "position", "delta", "delta adjusted position", "net exposure"]
-    for col in required:
-        if col not in idx:
-            raise ValueError(f"Exposure report column not found: {col}")
-
-    preamble = "\n".join(" ".join(str(x) for x in r if x is not None) for r in vals[:header_idx])
-    m = re.search(r"Report Date:\s*([0-9/\-]+)", preamble, re.I)
-    report_date = parse_date(m.group(1)) if m else None
-
-    positions = []
-    nav = None
-    for row in vals[header_idx + 1:]:
-        if not any(x is not None and str(x).strip() for x in row):
-            continue
-        def val(name):
-            j = idx.get(name)
-            return row[j] if j is not None and j < len(row) else None
-        sym = str(val("symbol") or "").strip()
-        if sym.lower().startswith("grand total"):
-            nav = _num(val("nav")) if "nav" in idx else None
-            continue
-        if not sym.startswith("O:"):
-            continue
-        parsed = parse_nirvana_option_symbol(sym)
-        if not parsed:
-            continue
-        qty = _num(val("position"))
-        delta = _num(val("delta"))
-        dap = _num(val("delta adjusted position"))
-        net = _num(val("net exposure"))
-        net_pct = _num(val("net exposure %")) if "net exposure %" in idx else None
-        if qty is None or delta is None or dap is None or net is None:
-            continue
-        baseline_spot = abs(net / dap) if abs(dap) > 1e-12 else None
-        if baseline_spot is None or not math.isfinite(baseline_spot) or baseline_spot <= 0:
-            continue
-        positions.append({
-            **parsed,
-            "quantity": qty,
-            "delta": delta,
-            "delta_adjusted_position": dap,
-            "net_exposure": net,
-            "net_exposure_pct": net_pct,
-            "baseline_underlying_price": baseline_spot,
-            "source_symbol": sym,
-        })
-
-    if not report_date:
-        raise ValueError("Could not read Report Date from the Exposure report.")
-    if not positions:
-        raise ValueError("No option rows with usable Delta / Delta Adjusted Position / Net Exposure were found.")
-    return {"report_date": report_date, "nav_usd": nav, "positions": positions}
+def _market_symbol(p: dict) -> str:
+    if p.get("instrument_type") == "OPTION":
+        return yahoo_option_symbol(p["ticker"], p["expiry"], p["option_type"], p["strike"])
+    return str(p["ticker"]).upper().replace(".", "-")
 
 
 def _http_json(url: str, timeout: int = 10):
@@ -325,9 +259,9 @@ def _parse_spark(payload, wanted):
             px = _positive(meta.get("regularMarketPrice"))
             source = "Yahoo regularMarketPrice"
             if px is None:
-                quote_block = ((r.get("indicators") or {}).get("quote") or [{}])[0]
-                px = _last_number(quote_block.get("close"))
-                source = "Yahoo 1m close"
+                q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
+                px = _last_number(q.get("close"))
+                source = "Yahoo latest 1m price"
             if symbol in wanted and px is not None:
                 out[symbol] = (px, source, "")
     except Exception:
@@ -343,8 +277,6 @@ def _chart_quote(symbol):
         payload, err = _http_json(url)
         if err:
             last_err = err
-            if "429" in err or "rate limited" in err.lower():
-                return None, "UNAVAILABLE", err
             continue
         try:
             results = payload.get("chart", {}).get("result") or []
@@ -356,25 +288,27 @@ def _chart_quote(symbol):
             px = _positive(meta.get("regularMarketPrice"))
             if px is not None:
                 return px, "Yahoo regularMarketPrice", ""
-            quote_block = ((r.get("indicators") or {}).get("quote") or [{}])[0]
-            px = _last_number(quote_block.get("close"))
+            q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
+            px = _last_number(q.get("close"))
             if px is not None:
-                return px, "Yahoo 1m close", ""
+                return px, "Yahoo latest 1m price", ""
         except Exception as e:
             last_err = f"Yahoo chart parse error: {e}"
     return None, "UNAVAILABLE", last_err
 
 
-def yahoo_underlying_spots(tickers):
-    """Fetch only underlying stock prices; no Yahoo option-chain calls."""
-    symbols = tuple(sorted({str(x).upper().strip() for x in tickers if str(x).strip()}))
+def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
+    """One batch Yahoo request for the exact option/equity symbols whenever possible."""
+    symbols = tuple(sorted({_market_symbol(p) for p in positions}))
     now = time.time()
-    with _spot_lock:
-        if _spot_cache["symbols"] == symbols and now - _spot_cache["ts"] < CACHE_SECONDS:
-            return dict(_spot_cache["data"]), _spot_cache["error"]
+
+    with _quote_lock:
+        if _quote_cache["symbols"] == symbols and now - _quote_cache["ts"] < CACHE_SECONDS:
+            return dict(_quote_cache["data"]), _quote_cache["error"]
 
     data = {}
     global_err = ""
+
     if symbols:
         qs = urlencode({
             "symbols": ",".join(symbols),
@@ -383,19 +317,20 @@ def yahoo_underlying_spots(tickers):
             "indicators": "close",
             "includePrePost": "false",
         })
-        spark_rate_limited = False
+        rate_limited = False
+
         for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
             payload, err = _http_json(f"https://{host}/v7/finance/spark?{qs}")
             if err:
                 global_err = err
                 if "429" in err or "rate limited" in err.lower():
-                    spark_rate_limited = True
+                    rate_limited = True
                 continue
             data.update(_parse_spark(payload or {}, set(symbols)))
             if data:
                 break
 
-        if not spark_rate_limited:
+        if not rate_limited:
             for symbol in symbols:
                 if symbol not in data:
                     px, src, err = _chart_quote(symbol)
@@ -404,84 +339,62 @@ def yahoo_underlying_spots(tickers):
             for symbol in symbols:
                 data.setdefault(symbol, (None, "UNAVAILABLE", global_err or "Yahoo rate limited"))
 
-    with _spot_lock:
-        _spot_cache.update({"ts": now, "symbols": symbols, "data": dict(data), "error": global_err})
+    with _quote_lock:
+        _quote_cache.update({
+            "ts": now,
+            "symbols": symbols,
+            "data": dict(data),
+            "error": global_err,
+        })
     return data, global_err
 
 
-def _key(p):
-    return (
-        str(p.get("ticker") or "").upper(),
-        str(p.get("expiry") or ""),
-        str(p.get("option_type") or "").upper(),
-        round(float(p.get("strike") or 0.0), 6),
-    )
-
-
-def calculate_delta_estimated_return(pnl_positions: list[dict], exposure_positions: list[dict], nav_usd: float) -> dict:
-    """First-order, delta-based intraday return estimate using Yahoo underlying prices."""
-    exposure_map = {_key(p): p for p in exposure_positions}
-    tickers = {p.get("ticker") for p in pnl_positions if p.get("ticker")}
-    spots, yahoo_error = yahoo_underlying_spots(tickers)
+def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote_data: dict | None = None) -> dict:
+    """Change = Current - Previous; P&L = Change * Qty * Multiplier."""
+    if quote_data is None:
+        quote_data, yahoo_error = yahoo_current_marks(positions)
+    else:
+        yahoo_error = ""
 
     rows = []
     total_pnl = 0.0
     valid = 0
-    quote_tickers_valid = {t for t, v in spots.items() if v and v[0] is not None}
 
-    for p in pnl_positions:
-        ticker = str(p.get("ticker") or "").upper()
-        current_spot, source, quote_note = spots.get(ticker, (None, "UNAVAILABLE", "Yahoo quote not returned"))
-        pnl = None
-        contrib = None
-        delta = None
-        dap = None
-        baseline_spot = None
-        match_note = ""
+    for p in positions:
+        symbol = _market_symbol(p)
+        current, source, note = quote_data.get(
+            symbol,
+            (None, "UNAVAILABLE", "Yahoo quote not returned")
+        )
+        previous = _positive(p.get("baseline_price"))
+        change = pnl = contrib = None
 
-        if p.get("instrument_type") == "OPTION":
-            e = exposure_map.get(_key(p))
-            if e is None:
-                match_note = "No same-date Exposure baseline match"
-            else:
-                delta = e.get("delta")
-                dap = e.get("delta_adjusted_position")
-                baseline_spot = e.get("baseline_underlying_price")
-                if current_spot is not None and dap is not None and baseline_spot is not None:
-                    pnl = float(dap) * (float(current_spot) - float(baseline_spot))
-        else:
-            baseline_spot = p.get("baseline_price")
-            dap = p.get("quantity")
-            if current_spot is not None and baseline_spot is not None:
-                pnl = float(p.get("quantity") or 0.0) * (float(current_spot) - float(baseline_spot))
-
-        if pnl is not None:
+        if current is not None and previous is not None:
+            change = float(current) - float(previous)
+            pnl = change * float(p.get("quantity") or 0.0) * float(p.get("multiplier") or 1.0)
             contrib = pnl / nav_usd * 100.0 if nav_usd else None
             total_pnl += pnl
             valid += 1
 
-        note_parts = [x for x in [match_note, quote_note] if x]
         rows.append({
             **p,
-            "nirvana_delta": delta,
-            "delta_adjusted_position": dap,
-            "baseline_underlying_price": baseline_spot,
-            "current_underlying_price": current_spot,
-            "price_source": source,
-            "note": " · ".join(note_parts),
+            "yahoo_symbol": symbol,
+            "previous_mark": previous,
+            "current_mark": current,
+            "change": change,
             "estimated_pnl": pnl,
             "contribution_pct": contrib,
+            "price_source": source,
+            "note": note or "",
         })
 
-    total = len(pnl_positions)
+    total = len(positions)
     return {
         "rows": rows,
         "estimated_pnl": total_pnl,
         "estimated_return_pct": (total_pnl / nav_usd * 100.0) if nav_usd else None,
         "coverage_valid": valid,
         "coverage_total": total,
-        "ticker_coverage_valid": len(quote_tickers_valid),
-        "ticker_coverage_total": len(tickers),
         "complete": bool(total and valid == total),
         "yahoo_error": yahoo_error,
         "calculated_at_utc": datetime.now(timezone.utc).isoformat(),
