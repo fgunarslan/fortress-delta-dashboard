@@ -53,8 +53,16 @@ def require_admin(request):
 
 def page(title,body,user=None,refresh=None):
     adminlink='<a href="/admin">Admin</a>' if user and user["username"]==ADMIN_USER else ""
-    daily='<a href="/daily-return">Daily Return</a>' if user else ""
-    auth=f'<span>{html.escape(user["username"])}</span> {daily} {adminlink} <a href="/logout">Logout</a>' if user else ""
+    if user:
+        auth=(
+            f'<span>{html.escape(user["username"])}</span> '
+            f'<a href="/">Bloomberg Delta Monitor</a> '
+            f'<a href="/bloomberg-daily-return">Bloomberg Daily Return</a> '
+            f'<a href="/daily-return">Yahoo Daily Return</a> '
+            f'{adminlink} <a href="/logout">Logout</a>'
+        )
+    else:
+        auth=""
     rf=f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">{rf}<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title><style>
@@ -69,7 +77,7 @@ input,select,button{{padding:8px;border:1px solid #c9d3e1;border-radius:7px}}but
 </style></head><body><div class="wrap"><nav><strong><a class="brand" href="/">Fortress Delta Monitor</a></strong><div>{auth}</div></nav>{body}</div></body></html>""")
 
 def admin_tabs():
-    return '<p><a href="/">Dashboard</a> · <a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/daily-return">Daily Return Upload</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
+    return '<p><a href="/">Dashboard</a> · <a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/daily-return">Daily Return Baseline</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
 
 @app.get("/health")
 def health():return {"ok":True}
@@ -435,7 +443,7 @@ def daily_return_page(request:Request):
         warning+=f'<div class="notice"><strong>Yahoo:</strong> {html.escape(calc["yahoo_error"])}</div><br>'
 
     quality_class='ok' if calc['complete'] else 'bad'
-    body=f'''<h1>RPD Fortress Fund — Estimated Daily Return</h1>
+    body=f'''<h1>RPD Fortress Fund — Yahoo Daily Return</h1>
 <div class="grid">
 <div class="card metric"><div class="muted">Status</div><div class="v {quality_class}">{status}</div><div class="muted">Mark-to-market estimate</div></div>
 <div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div>
@@ -450,7 +458,137 @@ def daily_return_page(request:Request):
 <br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark = Yahoo Bid/Ask midpoint when both are available; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Current Mark</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
-    return page("Estimated Daily Return",body,u,60 if auto_refresh_allowed() else None)
+    return page("Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
+
+
+@app.get("/bloomberg-daily-return")
+def bloomberg_daily_return_page(request:Request):
+    u=require_user(request)
+
+    with SessionLocal() as db:
+        b=_active_daily_baseline(db)
+        if not b:
+            extra=' <a href="/admin/daily-return">Upload P&amp;L Report</a>' if u["username"]==ADMIN_USER else ''
+            return page(
+                "Bloomberg Daily Return",
+                f'<h1>RPD Fortress Fund — Bloomberg Daily Return</h1>'
+                f'<div class="card"><div class="notice">No P&amp;L baseline has been uploaded yet.{extra}</div></div>',
+                u,60
+            )
+
+        dbpos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.id).all()
+        baseline={
+            "report_date":b.report_date,
+            "run_date":b.run_date,
+            "filename":b.filename,
+            "nav_usd":float(b.nav_usd),
+        }
+        snap,age=latest_snapshot(db)
+
+    positions=[{
+        "security_name":p.security_name,
+        "instrument_type":p.instrument_type,
+        "ticker":p.ticker,
+        "expiry":p.expiry,
+        "option_type":p.option_type,
+        "strike":p.strike,
+        "quantity":float(p.quantity),
+        "multiplier":float(p.multiplier or 100),
+        "baseline_price":float(p.baseline_price) if p.baseline_price is not None else None,
+    } for p in dbpos]
+
+    bbg_marks={}
+    snapshot_ts=""
+    collector_id=""
+    collector_mode=""
+    if snap:
+        snapshot_ts=snap.get("timestamp_utc","")
+        collector_id=snap.get("collector_id","")
+        collector_mode=snap.get("mode","")
+        for r in snap.get("positions",[]) or []:
+            try:
+                key=(
+                    str(r.get("ticker","")).upper(),
+                    str(r.get("expiry","")),
+                    str(r.get("option_type","")).upper(),
+                    round(float(r.get("strike")),6),
+                )
+                mark=r.get("option_mark")
+                bbg_marks[key]={
+                    "mark":float(mark) if mark is not None else None,
+                    "source":r.get("option_mark_source") or "",
+                }
+            except Exception:
+                continue
+
+    rows=""
+    total_pnl=0.0
+    valid=0
+    for p in positions:
+        strike=float(p.get("strike") or 0.0)
+        key=(p["ticker"].upper(),p["expiry"],p["option_type"].upper(),round(strike,6))
+        q=bbg_marks.get(key,{})
+        current=q.get("mark")
+        previous=p.get("baseline_price")
+        change=pnl=contrib=None
+        if current is not None and previous is not None:
+            change=float(current)-float(previous)
+            pnl=change*float(p["quantity"])*float(p["multiplier"])
+            contrib=pnl/baseline["nav_usd"]*100.0 if baseline["nav_usd"] else None
+            total_pnl+=pnl
+            valid+=1
+
+        posname=(f'{p["ticker"]} {p["expiry"]} {p["option_type"]}{strike:g}' if p["instrument_type"]=="OPTION" else p["ticker"])
+        prev_txt='—' if previous is None else f'${previous:.2f}'
+        cur_txt='—' if current is None else f'${current:.2f}'
+        chg_txt='—' if change is None else f'{change:+.2f}'
+        pnl_txt='—' if pnl is None else f'${pnl:+,.2f}'
+        con_txt='—' if contrib is None else f'{contrib:+.4f}%'
+        source=q.get("source") or ("Waiting for Bloomberg mark" if snap else "No Bloomberg snapshot")
+        rows+=(
+            f'<tr><td>{html.escape(posname)}</td><td>{p["quantity"]:,.0f}</td>'
+            f'<td>{prev_txt}</td><td>{cur_txt}</td><td>{chg_txt}</td>'
+            f'<td>{pnl_txt}</td><td>{con_txt}</td><td>{html.escape(source)}</td></tr>'
+        )
+
+    total=len(positions)
+    ret=(total_pnl/baseline["nav_usd"]*100.0) if baseline["nav_usd"] else 0.0
+    complete=(total>0 and valid==total)
+
+    if not snap:
+        status="WAITING"; status_class="bad"; feed_note="No Bloomberg Collector snapshot yet."
+    elif valid==0:
+        status="WAITING"; status_class="bad"; feed_note="The current snapshot does not yet contain Bloomberg option marks. The updated Collector must publish a new full snapshot."
+    elif complete:
+        status="FULL"; status_class="ok"; feed_note=f'Bloomberg snapshot age {age:.1f}s · {html.escape(collector_mode or "LIVE")}'
+    else:
+        status="PARTIAL"; status_class="bad"; feed_note=f'Bloomberg marks {valid}/{total} · snapshot age {age:.1f}s'
+
+    warning=""
+    if not complete:
+        warning='<div class="notice"><strong>'+status+':</strong> '+feed_note+' The displayed P&amp;L includes covered positions only.</div><br>'
+
+    body=f'''<h1>RPD Fortress Fund — Bloomberg Daily Return</h1>
+<div class="grid">
+<div class="card metric"><div class="muted">Status</div><div class="v {status_class}">{status}</div><div class="muted">Bloomberg marks</div></div>
+<div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div>
+<div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${total_pnl:+,.2f}</div></div>
+<div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${baseline['nav_usd']:,.2f}</div><div class="muted">Report {html.escape(baseline['report_date'])}</div></div>
+<div class="card metric"><div class="muted">Coverage</div><div class="v">{valid}/{total}</div><div class="muted">Bloomberg option marks</div></div>
+</div>
+{warning}
+<div class="card">
+<div class="muted">Shared P&amp;L baseline</div>
+<strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
+<br><div class="muted" style="margin-top:6px">
+Bloomberg snapshot: {html.escape(format_new_york_time(snapshot_ts)) if snapshot_ts else '—'}
+{(' · Collector: '+html.escape(collector_id)) if collector_id else ''}
+<br>Current Mark = Bloomberg option Bid/Ask midpoint when both are available; otherwise Bloomberg Last.
+Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier.
+Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.
+</div></div>
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Current</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    return page("Bloomberg Daily Return",body,u,60)
 
 @app.get("/admin/daily-return")
 def daily_return_admin(request:Request):
@@ -469,7 +607,7 @@ def daily_return_admin(request:Request):
 
     body=admin_tabs()+f'''
 <div class="card"><h2>Daily Return — P&amp;L Baseline</h2>
-<p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. That single PDF supplies positions, quantities, previous marks and NAV.</p>
+<p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. That single PDF supplies positions, quantities, previous marks and NAV and is shared by both Bloomberg Daily Return and Yahoo Daily Return.</p>
 <form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload P&amp;L Baseline</button></form><br>{current}</div>
 <div class="card"><h3>Calculation</h3>
 <p><strong>Current Mark = (Yahoo Bid + Yahoo Ask) ÷ 2 when both are available; otherwise Yahoo Last.</strong></p>
