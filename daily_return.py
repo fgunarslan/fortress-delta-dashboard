@@ -245,6 +245,51 @@ def _last_number(values):
     return None
 
 
+def _parse_quote_batch(payload, wanted):
+    """Parse Yahoo quote response.
+
+    Preferred mark:
+      Bid + Ask available -> midpoint
+      otherwise regularMarketPrice -> last fallback
+    """
+    out = {}
+    try:
+        results = ((payload or {}).get("quoteResponse") or {}).get("result") or []
+        for item in results:
+            symbol = str(item.get("symbol") or "").upper()
+            if symbol not in wanted:
+                continue
+
+            bid = _positive(item.get("bid"))
+            ask = _positive(item.get("ask"))
+            last = _positive(item.get("regularMarketPrice"))
+            if last is None:
+                last = _positive(item.get("postMarketPrice"))
+            if last is None:
+                last = _positive(item.get("preMarketPrice"))
+
+            mark = None
+            source = ""
+            if bid is not None and ask is not None and ask >= bid:
+                mark = (bid + ask) / 2.0
+                source = "Yahoo Bid/Ask Mid"
+            elif last is not None:
+                mark = last
+                source = "Yahoo Last / regularMarketPrice"
+
+            out[symbol] = {
+                "mark": mark,
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "source": source if mark is not None else "UNAVAILABLE",
+                "note": "",
+            }
+    except Exception:
+        pass
+    return out
+
+
 def _parse_spark(payload, wanted):
     out = {}
     try:
@@ -298,7 +343,14 @@ def _chart_quote(symbol):
 
 
 def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
-    """One batch Yahoo request for the exact option/equity symbols whenever possible."""
+    """Fetch current marks with minimal Yahoo requests.
+
+    Preferred current mark for every option/equity:
+      1. Bid and Ask both usable -> (Bid + Ask) / 2
+      2. Otherwise Yahoo regularMarketPrice / latest last price
+
+    No option-expiration discovery is used.
+    """
     symbols = tuple(sorted({_market_symbol(p) for p in positions}))
     now = time.time()
 
@@ -308,36 +360,79 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
 
     data = {}
     global_err = ""
+    wanted = set(symbols)
 
     if symbols:
-        qs = urlencode({
-            "symbols": ",".join(symbols),
-            "range": "1d",
-            "interval": "1m",
-            "indicators": "close",
-            "includePrePost": "false",
-        })
-        rate_limited = False
+        # First choice: one batch quote request for Bid / Ask / Last.
+        quote_qs = urlencode({"symbols": ",".join(symbols)})
+        quote_rate_limited = False
 
         for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-            payload, err = _http_json(f"https://{host}/v7/finance/spark?{qs}")
+            payload, err = _http_json(f"https://{host}/v7/finance/quote?{quote_qs}")
             if err:
                 global_err = err
                 if "429" in err or "rate limited" in err.lower():
-                    rate_limited = True
+                    quote_rate_limited = True
                 continue
-            data.update(_parse_spark(payload or {}, set(symbols)))
-            if data:
+            parsed = _parse_quote_batch(payload or {}, wanted)
+            if parsed:
+                data.update(parsed)
                 break
 
-        if not rate_limited:
+        # For missing symbols or missing mark, use ONE spark batch as fallback.
+        missing = [s for s in symbols if s not in data or data[s].get("mark") is None]
+        if missing and not quote_rate_limited:
+            spark_qs = urlencode({
+                "symbols": ",".join(missing),
+                "range": "1d",
+                "interval": "1m",
+                "indicators": "close",
+                "includePrePost": "false",
+            })
+            for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+                payload, err = _http_json(f"https://{host}/v7/finance/spark?{spark_qs}")
+                if err:
+                    global_err = err
+                    continue
+                spark_data = _parse_spark(payload or {}, set(missing))
+                for symbol, tup in spark_data.items():
+                    px, src, note = tup
+                    existing = data.get(symbol, {})
+                    existing.update({
+                        "mark": px,
+                        "last": px,
+                        "source": src,
+                        "note": note,
+                    })
+                    data[symbol] = existing
+                if spark_data:
+                    break
+
+        # Final individual chart fallback only for still-missing symbols and
+        # only when Yahoo has not already rate-limited the server.
+        if not quote_rate_limited:
             for symbol in symbols:
-                if symbol not in data:
-                    px, src, err = _chart_quote(symbol)
-                    data[symbol] = (px, src, err)
+                if symbol in data and data[symbol].get("mark") is not None:
+                    continue
+                px, src, err = _chart_quote(symbol)
+                existing = data.get(symbol, {})
+                existing.update({
+                    "mark": px,
+                    "last": px if px is not None else existing.get("last"),
+                    "source": src,
+                    "note": err,
+                })
+                data[symbol] = existing
         else:
             for symbol in symbols:
-                data.setdefault(symbol, (None, "UNAVAILABLE", global_err or "Yahoo rate limited"))
+                existing = data.get(symbol, {})
+                if existing.get("mark") is None:
+                    existing.update({
+                        "mark": None,
+                        "source": "UNAVAILABLE",
+                        "note": global_err or "Yahoo rate limited",
+                    })
+                data[symbol] = existing
 
     with _quote_lock:
         _quote_cache.update({
@@ -348,9 +443,16 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
         })
     return data, global_err
 
-
 def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote_data: dict | None = None) -> dict:
-    """Change = Current - Previous; P&L = Change * Qty * Multiplier."""
+    """Simple mark-to-market.
+
+    Current Mark:
+      Bid+Ask midpoint when both are available; otherwise Yahoo last.
+
+    Change = Current Mark - Previous P&L Report Price
+    Position P&L = Change * Quantity * Multiplier
+    Daily Return = Total P&L / Baseline NAV
+    """
     if quote_data is None:
         quote_data, yahoo_error = yahoo_current_marks(positions)
     else:
@@ -362,10 +464,23 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
 
     for p in positions:
         symbol = _market_symbol(p)
-        current, source, note = quote_data.get(
-            symbol,
-            (None, "UNAVAILABLE", "Yahoo quote not returned")
-        )
+        q = quote_data.get(symbol, {})
+
+        # Backward-compatible test/input tuple support.
+        if isinstance(q, (tuple, list)):
+            current = q[0] if len(q) > 0 else None
+            source = q[1] if len(q) > 1 else ""
+            note = q[2] if len(q) > 2 else ""
+            bid = ask = None
+            last = current
+        else:
+            current = q.get("mark")
+            bid = q.get("bid")
+            ask = q.get("ask")
+            last = q.get("last")
+            source = q.get("source") or ""
+            note = q.get("note") or ""
+
         previous = _positive(p.get("baseline_price"))
         change = pnl = contrib = None
 
@@ -380,12 +495,15 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
             **p,
             "yahoo_symbol": symbol,
             "previous_mark": previous,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
             "current_mark": current,
             "change": change,
             "estimated_pnl": pnl,
             "contribution_pct": contrib,
             "price_source": source,
-            "note": note or "",
+            "note": note,
         })
 
     total = len(positions)
@@ -399,7 +517,6 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
         "yahoo_error": yahoo_error,
         "calculated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
-
 
 def auto_refresh_allowed(now_utc=None):
     now_utc = now_utc or datetime.now(timezone.utc)

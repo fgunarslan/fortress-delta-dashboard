@@ -417,6 +417,8 @@ def daily_return_page(request:Request):
         strike="" if r.get("strike") is None else f'{r["strike"]:g}'
         posname=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"])
         previous='—' if r.get("previous_mark") is None else f'${r["previous_mark"]:.2f}'
+        bid='—' if r.get("bid") is None else f'${r["bid"]:.2f}'
+        ask='—' if r.get("ask") is None else f'${r["ask"]:.2f}'
         current='—' if r.get("current_mark") is None else f'${r["current_mark"]:.2f}'
         change='—' if r.get("change") is None else f'{r["change"]:+.2f}'
         epnl='—' if r.get("estimated_pnl") is None else f'${r["estimated_pnl"]:+,.2f}'
@@ -424,7 +426,7 @@ def daily_return_page(request:Request):
         source=(r.get("price_source") or "")
         if r.get("note"):
             source+=f' · {r["note"]}'
-        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>{previous}</td><td>{current}</td><td>{change}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(source)}</td></tr>'
+        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>{previous}</td><td>{bid}</td><td>{ask}</td><td>{current}</td><td>{change}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(source)}</td></tr>'
 
     warning=""
     if not calc["complete"]:
@@ -445,9 +447,9 @@ def daily_return_page(request:Request):
 <div class="card">
 <div class="muted">Daily Return baseline — completely separate from Bloomberg</div>
 <strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
-<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Formula: (Yahoo Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
+<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark = Yahoo Bid/Ask midpoint when both are available; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Current</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Current Mark</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Estimated Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/admin/daily-return")
@@ -470,7 +472,8 @@ def daily_return_admin(request:Request):
 <p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. That single PDF supplies positions, quantities, previous marks and NAV.</p>
 <form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload P&amp;L Baseline</button></form><br>{current}</div>
 <div class="card"><h3>Calculation</h3>
-<p><strong>Position P&amp;L = (Yahoo Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier</strong></p>
+<p><strong>Current Mark = (Yahoo Bid + Yahoo Ask) ÷ 2 when both are available; otherwise Yahoo Last.</strong></p>
+<p><strong>Position P&amp;L = (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier</strong></p>
 <p><strong>Estimated Daily Return = Total Estimated P&amp;L ÷ P&amp;L Report NAV</strong></p>
 <p class="muted">No Exposure-by-Underlying upload is required. Yahoo option-chain expiration discovery is not used. This Daily Return module is separate from Bloomberg and does not change Bloomberg positions, NAV, Collector, snapshots, config version, users or limits.</p></div>'''
     return page("Daily Return Upload",body,u)
