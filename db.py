@@ -95,7 +95,9 @@ class DailyReturnPosition(Base):
     multiplier=Column(Float,nullable=False,default=100)
     baseline_price=Column(Float,nullable=True)
     baseline_market_value=Column(Float,nullable=False)
-    manual_price=Column(Float,nullable=True)
+    manual_price=Column(Float,nullable=True)  # legacy field
+    yahoo_manual_price=Column(Float,nullable=True)
+    bloomberg_manual_price=Column(Float,nullable=True)
     created_at=Column(DateTime(timezone=True),default=utcnow)
 
 class DailyReturnExposureBaseline(Base):
@@ -124,6 +126,22 @@ class DailyReturnExposurePosition(Base):
     created_at=Column(DateTime(timezone=True),default=utcnow)
 
 Base.metadata.create_all(engine)
+
+# Add the two nullable override columns without changing existing users/data.
+try:
+    with engine.begin() as conn:
+        backend=engine.url.get_backend_name()
+        if backend=="postgresql":
+            conn.exec_driver_sql("ALTER TABLE daily_return_positions ADD COLUMN IF NOT EXISTS yahoo_manual_price DOUBLE PRECISION")
+            conn.exec_driver_sql("ALTER TABLE daily_return_positions ADD COLUMN IF NOT EXISTS bloomberg_manual_price DOUBLE PRECISION")
+        elif backend=="sqlite":
+            cols=[r[1] for r in conn.exec_driver_sql("PRAGMA table_info(daily_return_positions)").fetchall()]
+            if "yahoo_manual_price" not in cols:
+                conn.exec_driver_sql("ALTER TABLE daily_return_positions ADD COLUMN yahoo_manual_price FLOAT")
+            if "bloomberg_manual_price" not in cols:
+                conn.exec_driver_sql("ALTER TABLE daily_return_positions ADD COLUMN bloomberg_manual_price FLOAT")
+except Exception:
+    pass
 
 def get_setting(db,key,default=None):
     x=db.get(Setting,key)

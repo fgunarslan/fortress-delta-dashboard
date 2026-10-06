@@ -458,14 +458,12 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
     return data, global_err
 
 def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote_data: dict | None = None) -> dict:
-    """Simple mark-to-market.
+    """Simple mark-to-market with Yahoo manual override.
 
-    Current Mark:
-      Bid+Ask midpoint when both are available; otherwise Yahoo last.
-
-    Change = Current Mark - Previous P&L Report Price
-    Position P&L = Change * Quantity * Multiplier
-    Daily Return = Total P&L / Baseline NAV
+    Rule:
+      Yahoo Bid/Ask Mid available -> use market midpoint.
+      Otherwise, if manual override exists -> use manual price.
+      Otherwise -> use Yahoo fallback mark/last.
     """
     if quote_data is None:
         quote_data, yahoo_error = yahoo_current_marks(positions)
@@ -480,20 +478,30 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
         symbol = _market_symbol(p)
         q = quote_data.get(symbol, {})
 
-        # Backward-compatible test/input tuple support.
         if isinstance(q, (tuple, list)):
-            current = q[0] if len(q) > 0 else None
-            source = q[1] if len(q) > 1 else ""
+            market_mark = q[0] if len(q) > 0 else None
+            market_source = q[1] if len(q) > 1 else ""
             note = q[2] if len(q) > 2 else ""
             bid = ask = None
-            last = current
+            last = market_mark
         else:
-            current = q.get("mark")
+            market_mark = q.get("mark")
             bid = q.get("bid")
             ask = q.get("ask")
             last = q.get("last")
-            source = q.get("source") or ""
+            market_source = q.get("source") or ""
             note = q.get("note") or ""
+
+        manual = p.get("yahoo_manual_price")
+        if market_source == "Yahoo Bid/Ask Mid" and market_mark is not None:
+            current = market_mark
+            effective_source = "YAHOO MID"
+        elif manual is not None:
+            current = _positive(manual)
+            effective_source = "MANUAL OVERRIDE"
+        else:
+            current = market_mark
+            effective_source = "YAHOO LAST" if current is not None else "UNAVAILABLE"
 
         previous = _positive(p.get("baseline_price"))
         change = pnl = contrib = None
@@ -512,11 +520,15 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
             "bid": bid,
             "ask": ask,
             "last": last,
+            "market_mark": market_mark,
+            "market_source": market_source,
+            "manual_price": manual,
             "current_mark": current,
+            "effective_source": effective_source,
             "change": change,
             "estimated_pnl": pnl,
             "contribution_pct": contrib,
-            "price_source": source,
+            "price_source": effective_source,
             "note": note,
         })
 

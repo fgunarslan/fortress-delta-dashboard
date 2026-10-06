@@ -407,6 +407,8 @@ def daily_return_page(request:Request):
             "multiplier":p.multiplier,
             "baseline_price":p.baseline_price,
             "baseline_market_value":p.baseline_market_value,
+            "yahoo_manual_price":p.yahoo_manual_price,
+            "bloomberg_manual_price":p.bloomberg_manual_price,
         } for p in dbpos]
         baseline={
             "report_date":b.report_date,
@@ -427,14 +429,22 @@ def daily_return_page(request:Request):
         previous='—' if r.get("previous_mark") is None else f'${r["previous_mark"]:.2f}'
         bid='—' if r.get("bid") is None else f'${r["bid"]:.2f}'
         ask='—' if r.get("ask") is None else f'${r["ask"]:.2f}'
+        market='—' if r.get("market_mark") is None else f'${r["market_mark"]:.2f}'
         current='—' if r.get("current_mark") is None else f'${r["current_mark"]:.2f}'
+        manual_val='' if r.get("manual_price") is None else f'{float(r["manual_price"]):.4f}'
         change='—' if r.get("change") is None else f'{r["change"]:+.2f}'
         epnl='—' if r.get("estimated_pnl") is None else f'${r["estimated_pnl"]:+,.2f}'
         contrib='—' if r.get("contribution_pct") is None else f'{r["contribution_pct"]:+.4f}%'
-        source=(r.get("price_source") or "")
-        if r.get("note"):
-            source+=f' · {r["note"]}'
-        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>{previous}</td><td>{bid}</td><td>{ask}</td><td>{current}</td><td>{change}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(source)}</td></tr>'
+        source=(r.get("effective_source") or "")
+        if u["username"]==ADMIN_USER:
+            manual_html=(f'<form method="post" action="/admin/daily-return/manual-price" style="display:flex;gap:4px;align-items:center">'
+                         f'<input type="hidden" name="position_id" value="{r["id"]}">'
+                         f'<input type="hidden" name="source" value="YAHOO">'
+                         f'<input type="number" step="0.0001" min="0" name="price" value="{manual_val}" style="width:82px">'
+                         f'<button>Save</button><button name="clear" value="1">Clear</button></form>')
+        else:
+            manual_html='—' if not manual_val else f'${float(manual_val):.4f}'
+        rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>{previous}</td><td>{bid}</td><td>{ask}</td><td>{market}</td><td>{manual_html}</td><td>{current}</td><td>{change}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(source)}</td></tr>'
 
     warning=""
     if not calc["complete"]:
@@ -457,7 +467,7 @@ def daily_return_page(request:Request):
 <strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
 <br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark = Yahoo Bid/Ask midpoint when both are available; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Current Mark</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 
@@ -495,6 +505,8 @@ def bloomberg_daily_return_page(request:Request):
         "quantity":float(p.quantity),
         "multiplier":float(p.multiplier or 100),
         "baseline_price":float(p.baseline_price) if p.baseline_price is not None else None,
+        "position_id":p.id,
+        "bloomberg_manual_price":float(p.bloomberg_manual_price) if p.bloomberg_manual_price is not None else None,
     } for p in dbpos]
 
     bbg_marks={}
@@ -528,7 +540,19 @@ def bloomberg_daily_return_page(request:Request):
         strike=float(p.get("strike") or 0.0)
         key=(p["ticker"].upper(),p["expiry"],p["option_type"].upper(),round(strike,6))
         q=bbg_marks.get(key,{})
-        current=q.get("mark")
+        market_mark=q.get("mark")
+        market_source=q.get("source") or ""
+        manual=p.get("bloomberg_manual_price")
+        if market_source=="PX_BID/ASK_MID" and market_mark is not None:
+            current=market_mark
+            effective_source="BLOOMBERG MID"
+        elif manual is not None:
+            current=float(manual)
+            effective_source="MANUAL OVERRIDE"
+        else:
+            current=market_mark
+            effective_source="BLOOMBERG LAST" if current is not None else "UNAVAILABLE"
+
         previous=p.get("baseline_price")
         change=pnl=contrib=None
         if current is not None and previous is not None:
@@ -540,15 +564,24 @@ def bloomberg_daily_return_page(request:Request):
 
         posname=(f'{p["ticker"]} {p["expiry"]} {p["option_type"]}{strike:g}' if p["instrument_type"]=="OPTION" else p["ticker"])
         prev_txt='—' if previous is None else f'${previous:.2f}'
+        market_txt='—' if market_mark is None else f'${market_mark:.2f}'
         cur_txt='—' if current is None else f'${current:.2f}'
+        manual_val='' if manual is None else f'{float(manual):.4f}'
         chg_txt='—' if change is None else f'{change:+.2f}'
         pnl_txt='—' if pnl is None else f'${pnl:+,.2f}'
         con_txt='—' if contrib is None else f'{contrib:+.4f}%'
-        source=q.get("source") or ("Waiting for Bloomberg mark" if snap else "No Bloomberg snapshot")
+        if u["username"]==ADMIN_USER:
+            manual_html=(f'<form method="post" action="/admin/daily-return/manual-price" style="display:flex;gap:4px;align-items:center">'
+                         f'<input type="hidden" name="position_id" value="{p["position_id"]}">'
+                         f'<input type="hidden" name="source" value="BLOOMBERG">'
+                         f'<input type="number" step="0.0001" min="0" name="price" value="{manual_val}" style="width:82px">'
+                         f'<button>Save</button><button name="clear" value="1">Clear</button></form>')
+        else:
+            manual_html='—' if not manual_val else f'${float(manual_val):.4f}'
         rows+=(
             f'<tr><td>{html.escape(posname)}</td><td>{p["quantity"]:,.0f}</td>'
-            f'<td>{prev_txt}</td><td>{cur_txt}</td><td>{chg_txt}</td>'
-            f'<td>{pnl_txt}</td><td>{con_txt}</td><td>{html.escape(source)}</td></tr>'
+            f'<td>{prev_txt}</td><td>{market_txt}</td><td>{manual_html}</td><td>{cur_txt}</td><td>{chg_txt}</td>'
+            f'<td>{pnl_txt}</td><td>{con_txt}</td><td>{html.escape(effective_source)}</td></tr>'
         )
 
     total=len(positions)
@@ -587,7 +620,7 @@ Bloomberg snapshot: {html.escape(format_new_york_time(snapshot_ts)) if snapshot_
 Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier.
 Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.
 </div></div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Current</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Bloomberg Daily Return",body,u,60)
 
 @app.get("/admin/daily-return")
@@ -616,6 +649,47 @@ def daily_return_admin(request:Request):
 <p class="muted">No Exposure-by-Underlying upload is required. Yahoo option-chain expiration discovery is not used. This Daily Return module is separate from Bloomberg and does not change Bloomberg positions, NAV, Collector, snapshots, config version, users or limits.</p></div>'''
     return page("Daily Return Upload",body,u)
 
+
+@app.post("/admin/daily-return/manual-price")
+async def daily_return_manual_price(request:Request):
+    u=require_admin(request)
+    form=await request.form()
+    try:
+        position_id=int(form.get("position_id"))
+    except Exception:
+        raise HTTPException(400,"Invalid position id.")
+    source=str(form.get("source") or "").upper()
+    clear=str(form.get("clear") or "")=="1"
+    raw=str(form.get("price") or "").strip()
+
+    value=None
+    if not clear:
+        try:
+            value=float(raw)
+            if value < 0:
+                raise ValueError
+        except Exception:
+            raise HTTPException(400,"Manual price must be zero or greater.")
+
+    with SessionLocal() as db:
+        p=db.query(DailyReturnPosition).filter_by(id=position_id).first()
+        if not p:
+            raise HTTPException(404,"Position not found.")
+        if source=="YAHOO":
+            p.yahoo_manual_price=value
+            action="YAHOO_MANUAL_PRICE_CLEARED" if clear else "YAHOO_MANUAL_PRICE_SET"
+            redirect="/daily-return"
+        elif source=="BLOOMBERG":
+            p.bloomberg_manual_price=value
+            action="BLOOMBERG_MANUAL_PRICE_CLEARED" if clear else "BLOOMBERG_MANUAL_PRICE_SET"
+            redirect="/bloomberg-daily-return"
+        else:
+            raise HTTPException(400,"Unknown source.")
+        audit(db,u["username"],action,f"position_id={position_id}; price={value}")
+        db.commit()
+
+    return RedirectResponse(redirect,303)
+
 @app.post("/admin/daily-return/upload")
 async def daily_return_upload(request:Request,file:UploadFile=File(...)):
     u=require_admin(request)
@@ -641,7 +715,7 @@ async def daily_return_upload(request:Request,file:UploadFile=File(...)):
                 baseline_id=b.id,security_name=x["security_name"],instrument_type=x["instrument_type"],ticker=x["ticker"],
                 expiry=x.get("expiry","") or "",option_type=x.get("option_type","") or "",strike=x.get("strike"),
                 quantity=x["quantity"],multiplier=x["multiplier"],baseline_price=x.get("baseline_price"),
-                baseline_market_value=x["baseline_market_value"],manual_price=None))
+                baseline_market_value=x["baseline_market_value"],manual_price=None,yahoo_manual_price=None,bloomberg_manual_price=None))
         audit(db,u["username"],"DAILY_RETURN_PNL_BASELINE_UPLOADED",
               f'{filename}; report_date={parsed["report_date"]}; nav={parsed["nav_usd"]}; positions={len(parsed["positions"])}')
         db.commit()
