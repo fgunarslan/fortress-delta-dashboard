@@ -526,9 +526,15 @@ def bloomberg_daily_return_page(request:Request):
                     round(float(r.get("strike")),6),
                 )
                 mark=r.get("option_mark")
+                bid=r.get("option_bid")
+                ask=r.get("option_ask")
+                last=r.get("option_last")
                 bbg_marks[key]={
                     "mark":float(mark) if mark is not None else None,
                     "source":r.get("option_mark_source") or "",
+                    "bid":float(bid) if bid is not None else None,
+                    "ask":float(ask) if ask is not None else None,
+                    "last":float(last) if last is not None else None,
                 }
             except Exception:
                 continue
@@ -542,10 +548,16 @@ def bloomberg_daily_return_page(request:Request):
         q=bbg_marks.get(key,{})
         market_mark=q.get("mark")
         market_source=q.get("source") or ""
+        market_bid=q.get("bid")
+        market_ask=q.get("ask")
         manual=p.get("bloomberg_manual_price")
+
         if market_source=="PX_BID/ASK_MID" and market_mark is not None:
             current=market_mark
             effective_source="BLOOMBERG MID"
+        elif market_source=="PX_ASK_HALF" and market_mark is not None:
+            current=market_mark
+            effective_source="BLOOMBERG ASK/2"
         elif manual is not None:
             current=float(manual)
             effective_source="MANUAL OVERRIDE"
@@ -564,6 +576,8 @@ def bloomberg_daily_return_page(request:Request):
 
         posname=(f'{p["ticker"]} {p["expiry"]} {p["option_type"]}{strike:g}' if p["instrument_type"]=="OPTION" else p["ticker"])
         prev_txt='—' if previous is None else f'${previous:.2f}'
+        bid_txt='—' if market_bid is None else f'${market_bid:.2f}'
+        ask_txt='—' if market_ask is None else f'${market_ask:.2f}'
         market_txt='—' if market_mark is None else f'${market_mark:.2f}'
         cur_txt='—' if current is None else f'${current:.2f}'
         manual_val='' if manual is None else f'{float(manual):.4f}'
@@ -580,7 +594,8 @@ def bloomberg_daily_return_page(request:Request):
             manual_html='—' if not manual_val else f'${float(manual_val):.4f}'
         rows+=(
             f'<tr><td>{html.escape(posname)}</td><td>{p["quantity"]:,.0f}</td>'
-            f'<td>{prev_txt}</td><td>{market_txt}</td><td>{manual_html}</td><td>{cur_txt}</td><td>{chg_txt}</td>'
+            f'<td>{prev_txt}</td><td>{bid_txt}</td><td>{ask_txt}</td><td>{market_txt}</td>'
+            f'<td>{manual_html}</td><td>{cur_txt}</td><td>{chg_txt}</td>'
             f'<td>{pnl_txt}</td><td>{con_txt}</td><td>{html.escape(effective_source)}</td></tr>'
         )
 
@@ -620,7 +635,7 @@ Bloomberg snapshot: {html.escape(format_new_york_time(snapshot_ts)) if snapshot_
 Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier.
 Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.
 </div></div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Bloomberg Daily Return",body,u,60)
 
 @app.get("/admin/daily-return")
