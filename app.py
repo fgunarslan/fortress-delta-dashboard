@@ -56,6 +56,7 @@ def page(title,body,user=None,refresh=None):
     if user:
         auth=(
             f'<span>{html.escape(user["username"])}</span> '
+            f'<a href="/overview">Overview</a> '
             f'<a href="/">Bloomberg Delta Monitor</a> '
             f'<a href="/bloomberg-daily-return">Bloomberg Daily Return</a> '
             f'<a href="/daily-return">Yahoo Daily Return</a> '
@@ -120,6 +121,187 @@ def format_new_york_time(timestamp_utc):
         return ny.strftime("%d %b %Y, %H:%M:%S %Z")
     except Exception:
         return str(timestamp_utc or "")
+
+
+@app.get("/overview")
+def overview(request:Request):
+    u=require_user(request)
+
+    with SessionLocal() as db:
+        # ----- Delta summary -----
+        p,age=latest_snapshot(db)
+        cfg=int(get_setting(db,"config_version","1"))
+        limit=float(get_setting(db,"limit_pct","15"))
+        if p:
+            mode=p.get("mode","LIVE")
+            closed=(mode=="MARKET_CLOSED")
+            stale=(age>STALE_AFTER_SECONDS) and not closed
+            delta_status="MARKET CLOSED" if closed else ("OFFLINE / STALE" if stale else mode)
+            delta_sub="Final closing snapshot" if closed else f"Age {age:.1f}s"
+            delta_pct=float(p.get("delta_exposure_pct",0) or 0)
+            delta_usd=float(p.get("delta_exposure_usd",0) or 0)
+            delta_buffer=float(p.get("buffer_pct",limit-delta_pct) or 0)
+            cov=p.get("coverage",{}) or {}
+            delta_cov=f'{cov.get("valid",0)}/{cov.get("total",0)}'
+            collector_cfg=p.get("config_version","—")
+        else:
+            delta_status="WAITING"
+            delta_sub="No collector snapshot"
+            delta_pct=0.0
+            delta_usd=0.0
+            delta_buffer=limit
+            delta_cov="0/0"
+            collector_cfg="—"
+
+        # ----- Shared daily-return baseline -----
+        b=_active_daily_baseline(db)
+        if b:
+            dbpos=db.query(DailyReturnPosition).filter_by(
+                baseline_id=b.id
+            ).order_by(DailyReturnPosition.id).all()
+            baseline_nav=float(b.nav_usd or 0)
+            report_date=str(b.report_date or "—")
+
+            yahoo_positions=[{
+                "id":x.id,
+                "security_name":x.security_name,
+                "instrument_type":x.instrument_type,
+                "ticker":x.ticker,
+                "expiry":x.expiry,
+                "option_type":x.option_type,
+                "strike":x.strike,
+                "quantity":x.quantity,
+                "multiplier":x.multiplier,
+                "baseline_price":x.baseline_price,
+                "baseline_market_value":x.baseline_market_value,
+                "yahoo_manual_price":x.yahoo_manual_price,
+                "bloomberg_manual_price":x.bloomberg_manual_price,
+            } for x in dbpos]
+
+            ycalc=calculate_mark_to_market_return(yahoo_positions,baseline_nav)
+            yahoo_pnl=float(ycalc.get("estimated_pnl") or 0)
+            yahoo_ret=float(ycalc.get("estimated_return_pct") or 0)
+            yahoo_cov=f'{int(ycalc.get("coverage_valid") or 0)}/{int(ycalc.get("coverage_total") or 0)}'
+            yahoo_status="FULL" if ycalc.get("complete") else "PARTIAL"
+
+            # Bloomberg summary uses the same current snapshot and same v2.9
+            # effective-price priority: MID -> ASK/2 -> manual on LAST -> LAST.
+            bloomberg_pnl=0.0
+            bloomberg_valid=0
+            bloomberg_total=len(dbpos)
+
+            mark_map={}
+            if p:
+                for r in p.get("positions",[]) or []:
+                    try:
+                        key=(
+                            str(r.get("ticker","")).upper(),
+                            str(r.get("expiry","")),
+                            str(r.get("option_type","")).upper(),
+                            round(float(r.get("strike")),6),
+                        )
+                        mark_map[key]=r
+                    except Exception:
+                        pass
+
+            for x in dbpos:
+                try:
+                    key=(
+                        str(x.ticker or "").upper(),
+                        str(x.expiry or ""),
+                        str(x.option_type or "").upper(),
+                        round(float(x.strike),6),
+                    )
+                except Exception:
+                    continue
+                q=mark_map.get(key,{})
+                market=q.get("option_mark")
+                source=q.get("option_mark_source") or ""
+                manual=x.bloomberg_manual_price
+
+                if source in ("PX_BID/ASK_MID","PX_ASK_HALF") and market is not None:
+                    current=float(market)
+                elif manual is not None:
+                    current=float(manual)
+                elif market is not None:
+                    current=float(market)
+                else:
+                    current=None
+
+                previous=float(x.baseline_price) if x.baseline_price is not None else None
+                if current is not None and previous is not None:
+                    bloomberg_pnl+=(current-previous)*float(x.quantity or 0)*float(x.multiplier or 1)
+                    bloomberg_valid+=1
+
+            bloomberg_ret=(bloomberg_pnl/baseline_nav*100.0) if baseline_nav else 0.0
+            bloomberg_cov=f"{bloomberg_valid}/{bloomberg_total}"
+            bloomberg_status="FULL" if bloomberg_total and bloomberg_valid==bloomberg_total else "PARTIAL"
+        else:
+            baseline_nav=0.0
+            report_date="—"
+            yahoo_pnl=yahoo_ret=0.0
+            yahoo_cov="0/0"
+            yahoo_status="NO BASELINE"
+            bloomberg_pnl=bloomberg_ret=0.0
+            bloomberg_cov="0/0"
+            bloomberg_status="NO BASELINE"
+
+    def sign_class(v):
+        return "ok" if v>=0 else "bad"
+
+    body=f"""
+    <style>
+      .overview-section{{margin-top:22px}}
+      .overview-head{{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-bottom:10px}}
+      .overview-head h2{{margin:0;font-size:22px}}
+      .overview-head a{{white-space:nowrap}}
+      .overview-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px}}
+      .overview-card{{background:white;border:1px solid #dfe5ee;border-radius:16px;padding:18px;min-width:0}}
+      .overview-label{{font-size:14px;color:#71809a;margin-bottom:8px}}
+      .overview-value{{font-size:28px;font-weight:800;line-height:1.05;color:#13203a}}
+      .overview-sub{{font-size:14px;color:#71809a;margin-top:7px}}
+      .overview-value.ok{{color:#087f57}}
+      .overview-value.bad{{color:#a52828}}
+      @media(max-width:1100px){{.overview-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+      @media(max-width:700px){{.overview-grid{{grid-template-columns:1fr}}.overview-value{{font-size:24px}}}}
+    </style>
+
+    <h1>RPD Fortress Fund — Overview</h1>
+
+    <div class="overview-section">
+      <div class="overview-head"><h2>Bloomberg Delta Monitor</h2><a href="/">Open full monitor →</a></div>
+      <div class="overview-grid">
+        <div class="overview-card"><div class="overview-label">Feed</div><div class="overview-value ok">{html.escape(delta_status)}</div><div class="overview-sub">{html.escape(delta_sub)}</div></div>
+        <div class="overview-card"><div class="overview-label">Delta Exposure</div><div class="overview-value">{delta_pct:.3f}%</div><div class="overview-sub">${delta_usd:,.0f}</div></div>
+        <div class="overview-card"><div class="overview-label">Limit</div><div class="overview-value">{limit:.3f}%</div></div>
+        <div class="overview-card"><div class="overview-label">Buffer</div><div class="overview-value {sign_class(delta_buffer)}">{delta_buffer:+.3f}%</div></div>
+        <div class="overview-card"><div class="overview-label">Coverage</div><div class="overview-value">{delta_cov}</div><div class="overview-sub">Collector v{collector_cfg} / Portal v{cfg}</div></div>
+      </div>
+    </div>
+
+    <div class="overview-section">
+      <div class="overview-head"><h2>Bloomberg Daily Return</h2><a href="/bloomberg-daily-return">Open details →</a></div>
+      <div class="overview-grid">
+        <div class="overview-card"><div class="overview-label">Status</div><div class="overview-value ok">{bloomberg_status}</div><div class="overview-sub">Bloomberg marks</div></div>
+        <div class="overview-card"><div class="overview-label">Estimated Daily Return</div><div class="overview-value {sign_class(bloomberg_ret)}">{bloomberg_ret:+.4f}%</div></div>
+        <div class="overview-card"><div class="overview-label">Estimated P&amp;L</div><div class="overview-value {sign_class(bloomberg_pnl)}">${bloomberg_pnl:+,.2f}</div></div>
+        <div class="overview-card"><div class="overview-label">Baseline NAV</div><div class="overview-value">${baseline_nav:,.2f}</div><div class="overview-sub">Report {html.escape(report_date)}</div></div>
+        <div class="overview-card"><div class="overview-label">Coverage</div><div class="overview-value">{bloomberg_cov}</div><div class="overview-sub">Bloomberg option marks</div></div>
+      </div>
+    </div>
+
+    <div class="overview-section">
+      <div class="overview-head"><h2>Yahoo Daily Return</h2><a href="/daily-return">Open details →</a></div>
+      <div class="overview-grid">
+        <div class="overview-card"><div class="overview-label">Status</div><div class="overview-value ok">{yahoo_status}</div><div class="overview-sub">Mark-to-market estimate</div></div>
+        <div class="overview-card"><div class="overview-label">Estimated Daily Return</div><div class="overview-value {sign_class(yahoo_ret)}">{yahoo_ret:+.4f}%</div></div>
+        <div class="overview-card"><div class="overview-label">Estimated P&amp;L</div><div class="overview-value {sign_class(yahoo_pnl)}">${yahoo_pnl:+,.2f}</div></div>
+        <div class="overview-card"><div class="overview-label">Baseline NAV</div><div class="overview-value">${baseline_nav:,.2f}</div><div class="overview-sub">Report {html.escape(report_date)}</div></div>
+        <div class="overview-card"><div class="overview-label">Coverage</div><div class="overview-value">{yahoo_cov}</div><div class="overview-sub">Yahoo current marks</div></div>
+      </div>
+    </div>
+    """
+    return page("Overview",body,u,60)
 
 @app.get("/")
 def dashboard(request:Request):
