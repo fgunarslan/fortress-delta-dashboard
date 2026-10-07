@@ -647,7 +647,7 @@ def daily_return_page(request:Request):
 <div class="card">
 <div class="muted">Daily Return baseline — completely separate from Bloomberg</div>
 <strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
-<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark = Yahoo Bid/Ask midpoint when both are available; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
+<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark = Yahoo Bid/Ask midpoint when both are available; if Bid is unavailable/zero and Ask is available, Ask/2; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)

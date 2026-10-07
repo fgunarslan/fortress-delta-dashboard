@@ -279,6 +279,7 @@ def _parse_quote_batch(payload, wanted):
 
     Preferred mark:
       Bid + Ask available -> midpoint
+      Bid missing/zero + Ask available -> Ask / 2
       otherwise regularMarketPrice -> last fallback
     """
     out = {}
@@ -302,6 +303,9 @@ def _parse_quote_batch(payload, wanted):
             if bid is not None and ask is not None and ask >= bid:
                 mark = (bid + ask) / 2.0
                 source = "Yahoo Bid/Ask Mid"
+            elif bid is None and ask is not None:
+                mark = ask / 2.0
+                source = "Yahoo Ask/2"
             elif last is not None:
                 mark = last
                 source = "Yahoo Last / regularMarketPrice"
@@ -462,6 +466,7 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
 
     Rule:
       Yahoo Bid/Ask Mid available -> use market midpoint.
+      Bid missing/zero + Ask available -> use Ask / 2.
       Otherwise, if manual override exists -> use manual price.
       Otherwise -> use Yahoo fallback mark/last.
     """
@@ -496,6 +501,9 @@ def calculate_mark_to_market_return(positions: list[dict], nav_usd: float, quote
         if market_source == "Yahoo Bid/Ask Mid" and market_mark is not None:
             current = market_mark
             effective_source = "YAHOO MID"
+        elif market_source == "Yahoo Ask/2" and market_mark is not None:
+            current = market_mark
+            effective_source = "YAHOO ASK/2"
         elif manual is not None:
             current = _positive(manual)
             effective_source = "MANUAL OVERRIDE"
