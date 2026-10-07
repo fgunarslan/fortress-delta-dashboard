@@ -413,10 +413,14 @@ def _yahoo_options_payload(ticker: str, expiry: str):
                     continue
                 result = ((payload.get("optionChain") or {}).get("result") or [])
                 if result:
+                    print(f"[YAHOO_CHAIN] OK ticker={ticker} expiry={expiry} host={host} result_count={len(result)}", flush=True)
                     return payload, ""
                 last_error = "Yahoo optionChain returned no result"
+                print(f"[YAHOO_CHAIN] EMPTY ticker={ticker} expiry={expiry} host={host}", flush=True)
             except Exception as e:
                 last_error = f"Yahoo options endpoint error: {e}"
+                print(f"[YAHOO_CHAIN] ERROR ticker={ticker} expiry={expiry} host={host} error={e}", flush=True)
+        print(f"[YAHOO_CHAIN] FAILED ticker={ticker} expiry={expiry} error={last_error}", flush=True)
         return {}, last_error
     except Exception as e:
         return {}, f"Yahoo options setup error: {e}"
@@ -533,10 +537,14 @@ def _options_chain_current_marks(positions: list[dict]) -> tuple[dict, str]:
                         found.add(contract)
 
             missing = sorted(wanted - found)
+            print(
+                f"[YAHOO_CHAIN] MATCH ticker={ticker} expiry={expiry} wanted={len(wanted)} found={len(found)} missing={len(missing)}",
+                flush=True,
+            )
             if missing:
-                errors.append(
-                    f"{ticker} {expiry}: exact contract not found: {', '.join(missing)}"
-                )
+                msg=f"{ticker} {expiry}: exact contract not found: {', '.join(missing)}"
+                errors.append(msg)
+                print(f"[YAHOO_CHAIN] MISS {msg}", flush=True)
         except Exception as e:
             errors.append(f"{ticker} {expiry}: parse error: {e}")
 
@@ -636,9 +644,10 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
         }
 
     incomplete = any(data.get(s, {}).get("mark") is None for s in symbols)
-    global_err = ""
-    if incomplete:
-        global_err = chain_error or auth_error or fallback_error
+    # During diagnostics, surface Options Chain errors even if the legacy fallback
+    # still gives full coverage. This lets the web page and Render logs explain
+    # why Bid/Ask columns are empty.
+    global_err = chain_error or (auth_error if incomplete else "") or (fallback_error if incomplete else "")
 
     with _quote_lock:
         _quote_cache.update({
