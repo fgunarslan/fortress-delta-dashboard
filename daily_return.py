@@ -24,10 +24,17 @@ _quote_lock = threading.Lock()
 _quote_cache = {"ts": 0.0, "symbols": (), "data": {}, "error": ""}
 CACHE_SECONDS = 55
 
-# Yahoo's public option-chain quotes are delayed, so there is no value in
-# re-requesting the full chain every page refresh. Keep a short shared cache.
-_chain_cache = {"ts": 0.0, "signature": (), "data": {}, "error": ""}
-CHAIN_CACHE_SECONDS = 120
+# Yahoo option-chain quotes are delayed. Cache each (ticker, expiry) chain
+# for 15 minutes so page refreshes / Overview do not re-hit Yahoo.
+CHAIN_CACHE_SECONDS = 15 * 60
+_chain_group_cache = {}  # {(ticker, expiry): {"ts": ..., "data": ..., "error": ""}}
+
+# Render uses shared/cloud IPs. If Yahoo returns HTTP 429, enter a short global
+# cooldown instead of hammering the endpoint again from the same IP.
+_chain_rate_limit_until = 0.0
+CHAIN_429_COOLDOWN_SECONDS = 5 * 60
+CHAIN_REQUEST_SPACING_SECONDS = 0.8
+CHAIN_429_RETRY_DELAY_SECONDS = 2.5
 
 _yfdata_obj = None
 
@@ -382,14 +389,22 @@ def _chart_quote(symbol):
 
 
 
-def _yahoo_options_payload(ticker: str, expiry: str):
-    """Authenticated Yahoo Options Chain request.
 
-    Uses the same yfinance YfData session/cookie/crumb machinery already used
-    by the quote request, but calls Yahoo's actual options-chain endpoint
-    directly instead of Ticker.option_chain().
+def _yahoo_options_payload(ticker: str, expiry: str):
+    """Authenticated Yahoo Options Chain request, rate-limit aware.
+
+    Uses ONE Yahoo host only. On HTTP 429 / Too Many Requests:
+      - wait briefly,
+      - retry once,
+      - then enter a global cooldown so the app stops hammering Yahoo.
     """
-    global _yfdata_obj
+    global _yfdata_obj, _chain_rate_limit_until
+
+    now = time.time()
+    if now < _chain_rate_limit_until:
+        remaining = int(_chain_rate_limit_until - now)
+        return {}, f"Yahoo Options Chain cooldown active ({remaining}s remaining after HTTP 429)"
+
     try:
         from yfinance.data import YfData
         if _yfdata_obj is None:
@@ -398,66 +413,104 @@ def _yahoo_options_payload(ticker: str, expiry: str):
         expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         expiry_epoch = int(expiry_dt.timestamp())
 
+        host = "query2.finance.yahoo.com"
+        url = f"https://{host}/v7/finance/options/{quote(ticker, safe='')}"
+        params = {"date": expiry_epoch}
+
         last_error = ""
-        for host in ("query2.finance.yahoo.com", "query1.finance.yahoo.com"):
+        for attempt in (1, 2):
             try:
-                response = _yfdata_obj.get(
-                    url=f"https://{host}/v7/finance/options/{quote(ticker, safe='')}",
-                    params={"date": expiry_epoch},
-                    timeout=12,
-                )
+                response = _yfdata_obj.get(url=url, params=params, timeout=12)
+
+                status = getattr(response, "status_code", None)
+                body_text = ""
+                try:
+                    body_text = response.text or ""
+                except Exception:
+                    body_text = ""
+
+                # Explicit 429 handling before response.json().
+                if status == 429 or "Too Many Requests" in body_text or "Rate limited" in body_text:
+                    last_error = "Yahoo options endpoint rate limited (HTTP 429)"
+                    print(
+                        f"[YAHOO_CHAIN] RATE_LIMIT ticker={ticker} expiry={expiry} attempt={attempt}",
+                        flush=True,
+                    )
+                    if attempt == 1:
+                        time.sleep(CHAIN_429_RETRY_DELAY_SECONDS)
+                        continue
+
+                    _chain_rate_limit_until = time.time() + CHAIN_429_COOLDOWN_SECONDS
+                    return {}, last_error
+
                 payload = response.json()
                 err = ((payload.get("finance") or {}).get("error") or {})
                 if err:
-                    last_error = f"Yahoo: {err.get('code','Error')} — {err.get('description','')}".strip()
-                    continue
+                    code = str(err.get("code") or "Error")
+                    desc = str(err.get("description") or "")
+                    last_error = f"Yahoo: {code} — {desc}".strip()
+                    if "Too Many Requests" in last_error or "Rate" in last_error:
+                        print(
+                            f"[YAHOO_CHAIN] RATE_LIMIT ticker={ticker} expiry={expiry} attempt={attempt} error={last_error}",
+                            flush=True,
+                        )
+                        if attempt == 1:
+                            time.sleep(CHAIN_429_RETRY_DELAY_SECONDS)
+                            continue
+                        _chain_rate_limit_until = time.time() + CHAIN_429_COOLDOWN_SECONDS
+                    return {}, last_error
+
                 result = ((payload.get("optionChain") or {}).get("result") or [])
                 if result:
-                    print(f"[YAHOO_CHAIN] OK ticker={ticker} expiry={expiry} host={host} result_count={len(result)}", flush=True)
+                    print(
+                        f"[YAHOO_CHAIN] OK ticker={ticker} expiry={expiry} host={host} result_count={len(result)}",
+                        flush=True,
+                    )
                     return payload, ""
+
                 last_error = "Yahoo optionChain returned no result"
-                print(f"[YAHOO_CHAIN] EMPTY ticker={ticker} expiry={expiry} host={host}", flush=True)
+                print(
+                    f"[YAHOO_CHAIN] EMPTY ticker={ticker} expiry={expiry} host={host}",
+                    flush=True,
+                )
+                return {}, last_error
+
             except Exception as e:
                 last_error = f"Yahoo options endpoint error: {e}"
-                print(f"[YAHOO_CHAIN] ERROR ticker={ticker} expiry={expiry} host={host} error={e}", flush=True)
-        print(f"[YAHOO_CHAIN] FAILED ticker={ticker} expiry={expiry} error={last_error}", flush=True)
-        return {}, last_error
+                is_rate_limit = "Too Many Requests" in last_error or "Rate limited" in last_error or "429" in last_error
+                if is_rate_limit:
+                    print(
+                        f"[YAHOO_CHAIN] RATE_LIMIT ticker={ticker} expiry={expiry} attempt={attempt} error={e}",
+                        flush=True,
+                    )
+                    if attempt == 1:
+                        time.sleep(CHAIN_429_RETRY_DELAY_SECONDS)
+                        continue
+                    _chain_rate_limit_until = time.time() + CHAIN_429_COOLDOWN_SECONDS
+                    return {}, last_error
+
+                print(
+                    f"[YAHOO_CHAIN] ERROR ticker={ticker} expiry={expiry} host={host} error={e}",
+                    flush=True,
+                )
+                return {}, last_error
+
+        return {}, last_error or "Yahoo Options Chain request failed"
+
     except Exception as e:
         return {}, f"Yahoo options setup error: {e}"
 
 
+
 def _options_chain_current_marks(positions: list[dict]) -> tuple[dict, str]:
-    """Read Bid/Ask/Last directly from Yahoo's option-chain endpoint.
+    """Read Yahoo Bid/Ask/Last with per-chain 15-minute cache.
 
-    Positions are grouped by (ticker, expiry). Every returned row is matched
-    against the exact OCC contractSymbol generated by _market_symbol().
-
-    Mark rules:
-      - Bid > 0 and Ask > 0 -> midpoint
-      - Bid missing/zero and Ask > 0 -> Ask / 2
-      - otherwise chain Last
+    Each unique (ticker, expiry) is requested at most once per 15 minutes.
+    Fresh requests are sequential and spaced out to reduce Yahoo rate limiting.
+    If a 429 occurs, remaining uncached chains are skipped for this cycle.
     """
     if not positions:
         return {}, ""
-
-    signature = tuple(sorted(
-        (
-            str(p.get("ticker") or "").upper(),
-            str(p.get("expiry") or ""),
-            str(p.get("option_type") or "").upper(),
-            float(p.get("strike") or 0),
-            _market_symbol(p),
-        )
-        for p in positions
-    ))
-    now = time.time()
-
-    with _quote_lock:
-        if (
-            _chain_cache["signature"] == signature
-            and now - _chain_cache["ts"] < CHAIN_CACHE_SECONDS
-        ):
-            return dict(_chain_cache["data"]), _chain_cache["error"]
 
     grouped = {}
     for p in positions:
@@ -468,97 +521,126 @@ def _options_chain_current_marks(positions: list[dict]) -> tuple[dict, str]:
 
     out = {}
     errors = []
+    now = time.time()
+    fresh_request_count = 0
+    hit_rate_limit = False
 
-    for (ticker, expiry), group_positions in grouped.items():
-        payload, err = _yahoo_options_payload(ticker, expiry)
-        if err:
-            errors.append(f"{ticker} {expiry}: {err}")
-            continue
+    for (ticker, expiry), group_positions in sorted(grouped.items()):
+        key = (ticker, expiry)
+        cached = _chain_group_cache.get(key)
 
-        try:
-            result = ((payload.get("optionChain") or {}).get("result") or [])
-            if not result:
-                errors.append(f"{ticker} {expiry}: no optionChain result")
-                continue
-
-            root = result[0] or {}
-            options_sets = root.get("options") or []
-            if not options_sets:
-                errors.append(f"{ticker} {expiry}: no options rows")
-                continue
-
-            wanted = {_market_symbol(p).upper() for p in group_positions}
-            found = set()
-
-            # Yahoo may return one or more options buckets; inspect all.
-            for bucket in options_sets:
-                for side_key in ("calls", "puts"):
-                    for row in (bucket.get(side_key) or []):
-                        contract = str(row.get("contractSymbol") or "").upper().strip()
-                        if contract not in wanted:
-                            continue
-
-                        def _finite_number(v):
-                            try:
-                                x = float(v)
-                                return x if math.isfinite(x) else None
-                            except Exception:
-                                return None
-
-                        bid_display = _finite_number(row.get("bid"))
-                        ask_display = _finite_number(row.get("ask"))
-                        last_display = _finite_number(row.get("lastPrice"))
-
-                        usable_bid = bid_display if bid_display is not None and bid_display > 0 else None
-                        usable_ask = ask_display if ask_display is not None and ask_display > 0 else None
-                        last = last_display if last_display is not None and last_display >= 0 else None
-
-                        if usable_bid is not None and usable_ask is not None and usable_ask >= usable_bid:
-                            mark = (usable_bid + usable_ask) / 2.0
-                            source = "Yahoo Options Chain Mid"
-                        elif usable_ask is not None and usable_bid is None:
-                            mark = usable_ask / 2.0
-                            source = "Yahoo Options Chain Ask/2"
-                        elif last is not None:
-                            mark = last
-                            source = "Yahoo Options Chain Last"
-                        else:
-                            mark = None
-                            source = "UNAVAILABLE"
-
-                        out[contract] = {
-                            "mark": mark,
-                            "bid": bid_display,
-                            "ask": ask_display,
-                            "last": last_display,
-                            "source": source,
-                            "note": "Yahoo Options Chain direct",
-                        }
-                        found.add(contract)
-
-            missing = sorted(wanted - found)
+        if cached and now - float(cached.get("ts") or 0) < CHAIN_CACHE_SECONDS:
+            cached_data = cached.get("data") or {}
+            out.update(cached_data)
+            cached_err = cached.get("error") or ""
+            if cached_err:
+                errors.append(cached_err)
             print(
-                f"[YAHOO_CHAIN] MATCH ticker={ticker} expiry={expiry} wanted={len(wanted)} found={len(found)} missing={len(missing)}",
+                f"[YAHOO_CHAIN] CACHE ticker={ticker} expiry={expiry} rows={len(cached_data)}",
                 flush=True,
             )
-            if missing:
-                msg=f"{ticker} {expiry}: exact contract not found: {', '.join(missing)}"
-                errors.append(msg)
-                print(f"[YAHOO_CHAIN] MISS {msg}", flush=True)
-        except Exception as e:
-            errors.append(f"{ticker} {expiry}: parse error: {e}")
+            continue
 
-    err = " | ".join(errors)
+        if hit_rate_limit:
+            errors.append(f"{ticker} {expiry}: skipped due to Yahoo 429 cooldown")
+            continue
 
-    with _quote_lock:
-        _chain_cache.update({
-            "ts": now,
-            "signature": signature,
-            "data": dict(out),
-            "error": err,
-        })
+        # Space only fresh Yahoo chain calls; cached chains cost nothing.
+        if fresh_request_count > 0:
+            time.sleep(CHAIN_REQUEST_SPACING_SECONDS)
+        fresh_request_count += 1
 
-    return out, err
+        payload, err = _yahoo_options_payload(ticker, expiry)
+
+        if err and ("429" in err or "rate limit" in err.lower() or "cooldown" in err.lower()):
+            hit_rate_limit = True
+
+        group_data = {}
+
+        if not err:
+            try:
+                result = ((payload.get("optionChain") or {}).get("result") or [])
+                if not result:
+                    err = f"{ticker} {expiry}: no optionChain result"
+                else:
+                    root = result[0] or {}
+                    options_sets = root.get("options") or []
+                    if not options_sets:
+                        err = f"{ticker} {expiry}: no options rows"
+                    else:
+                        wanted = {_market_symbol(p).upper() for p in group_positions}
+                        found = set()
+
+                        for bucket in options_sets:
+                            for side_key in ("calls", "puts"):
+                                for row in (bucket.get(side_key) or []):
+                                    contract = str(row.get("contractSymbol") or "").upper().strip()
+                                    if contract not in wanted:
+                                        continue
+
+                                    def _finite_number(v):
+                                        try:
+                                            x = float(v)
+                                            return x if math.isfinite(x) else None
+                                        except Exception:
+                                            return None
+
+                                    bid_display = _finite_number(row.get("bid"))
+                                    ask_display = _finite_number(row.get("ask"))
+                                    last_display = _finite_number(row.get("lastPrice"))
+
+                                    usable_bid = bid_display if bid_display is not None and bid_display > 0 else None
+                                    usable_ask = ask_display if ask_display is not None and ask_display > 0 else None
+                                    last = last_display if last_display is not None and last_display >= 0 else None
+
+                                    if usable_bid is not None and usable_ask is not None and usable_ask >= usable_bid:
+                                        mark = (usable_bid + usable_ask) / 2.0
+                                        source = "Yahoo Options Chain Mid"
+                                    elif usable_ask is not None and usable_bid is None:
+                                        mark = usable_ask / 2.0
+                                        source = "Yahoo Options Chain Ask/2"
+                                    elif last is not None:
+                                        mark = last
+                                        source = "Yahoo Options Chain Last"
+                                    else:
+                                        mark = None
+                                        source = "UNAVAILABLE"
+
+                                    group_data[contract] = {
+                                        "mark": mark,
+                                        "bid": bid_display,
+                                        "ask": ask_display,
+                                        "last": last_display,
+                                        "source": source,
+                                        "note": "Yahoo Options Chain cached 15m",
+                                    }
+                                    found.add(contract)
+
+                        missing = sorted(wanted - found)
+                        print(
+                            f"[YAHOO_CHAIN] MATCH ticker={ticker} expiry={expiry} wanted={len(wanted)} found={len(found)} missing={len(missing)}",
+                            flush=True,
+                        )
+                        if missing:
+                            err = f"{ticker} {expiry}: exact contract not found: {', '.join(missing)}"
+
+            except Exception as e:
+                err = f"{ticker} {expiry}: parse error: {e}"
+
+        # Cache successful data for 15 minutes. Cache ordinary non-429 errors
+        # briefly through the same window too, to avoid rapid repeated failures.
+        _chain_group_cache[key] = {
+            "ts": time.time(),
+            "data": dict(group_data),
+            "error": err or "",
+        }
+
+        out.update(group_data)
+        if err:
+            errors.append(err)
+            print(f"[YAHOO_CHAIN] GROUP_ERROR ticker={ticker} expiry={expiry} error={err}", flush=True)
+
+    return out, " | ".join(errors)
 
 
 def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
@@ -566,6 +648,7 @@ def yahoo_current_marks(positions: list[dict]) -> tuple[dict, str]:
 
     Primary:
       Yahoo Finance direct options-chain endpoint, exact contractSymbol match.
+      Each (ticker, expiry) chain is cached for 15 minutes.
 
     Chain mark rules:
       1. Bid + Ask -> midpoint
