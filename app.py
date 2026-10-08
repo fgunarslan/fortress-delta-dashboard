@@ -13,7 +13,7 @@ from daily_return import parse_nirvana_pnl_pdf,calculate_mark_to_market_return,a
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="Fortress Delta Dashboard v2",docs_url=None,redoc_url=None)
+app=FastAPI(title="Fortress Delta Dashboard v4.0 — Yahoo Local Collector",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -178,7 +178,13 @@ def overview(request:Request):
                 "bloomberg_manual_price":x.bloomberg_manual_price,
             } for x in dbpos]
 
-            ycalc=calculate_mark_to_market_return(yahoo_positions,baseline_nav)
+            yahoo_snapshot=_latest_yahoo_collector_snapshot(db)
+            yahoo_quote_data=_yahoo_quote_data_from_snapshot(yahoo_snapshot)
+            ycalc=calculate_mark_to_market_return(
+                yahoo_positions,
+                baseline_nav,
+                quote_data=yahoo_quote_data,
+            )
             yahoo_pnl=float(ycalc.get("estimated_pnl") or 0)
             yahoo_ret=float(ycalc.get("estimated_return_pct") or 0)
             yahoo_cov=f'{int(ycalc.get("coverage_valid") or 0)}/{int(ycalc.get("coverage_total") or 0)}'
@@ -567,6 +573,39 @@ def import_apply(request:Request,jid:str,mapping_json:str=Form(...),mode:str=For
 def _active_daily_baseline(db):
     return db.query(DailyReturnBaseline).filter_by(active=True).order_by(DailyReturnBaseline.id.desc()).first()
 
+
+def _latest_yahoo_collector_snapshot(db):
+    """Return the latest Yahoo local-collector snapshot stored in Settings."""
+    raw=get_setting(db,"yahoo_collector_snapshot","")
+    if not raw:
+        return None
+    try:
+        data=json.loads(raw)
+        if not isinstance(data,dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+def _yahoo_quote_data_from_snapshot(snapshot):
+    """Convert local collector rows into calculate_mark_to_market_return quote_data."""
+    out={}
+    if not snapshot:
+        return out
+    for r in snapshot.get("positions",[]) or []:
+        symbol=str(r.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        out[symbol]={
+            "mark":r.get("mark"),
+            "bid":r.get("bid"),
+            "ask":r.get("ask"),
+            "last":r.get("last"),
+            "source":r.get("source") or "",
+            "note":r.get("note") or "",
+        }
+    return out
+
 @app.get("/daily-return")
 def daily_return_page(request:Request):
     u=require_user(request)
@@ -599,7 +638,15 @@ def daily_return_page(request:Request):
             "nav_usd":b.nav_usd,
         }
 
-    calc=calculate_mark_to_market_return(positions,float(baseline["nav_usd"]))
+    with SessionLocal() as db:
+        yahoo_snapshot=_latest_yahoo_collector_snapshot(db)
+    yahoo_quote_data=_yahoo_quote_data_from_snapshot(yahoo_snapshot)
+    calc=calculate_mark_to_market_return(
+        positions,
+        float(baseline["nav_usd"]),
+        quote_data=yahoo_quote_data,
+    )
+    calc["yahoo_error"]=""
     status="FULL" if calc["complete"] else "PARTIAL"
     ret=calc["estimated_return_pct"] or 0.0
     pnl=calc["estimated_pnl"] or 0.0
@@ -630,9 +677,23 @@ def daily_return_page(request:Request):
 
     warning=""
     if not calc["complete"]:
-        warning='<div class="notice"><strong>PARTIAL:</strong> Yahoo did not return a usable current mark for every position. The return shown includes only covered positions.</div><br>'
-    if calc.get("yahoo_error"):
-        warning+=f'<div class="notice"><strong>Yahoo:</strong> {html.escape(calc["yahoo_error"])}</div><br>'
+        warning='<div class="notice"><strong>PARTIAL:</strong> Yahoo local collector has not supplied a usable current mark for every position. The return shown includes only covered positions.</div><br>'
+
+    if yahoo_snapshot:
+        yahoo_collector_name=str(yahoo_snapshot.get("collector_name") or "Yahoo-PC")
+        yahoo_collected_at=str(yahoo_snapshot.get("collected_at_utc") or "")
+        yahoo_collector_error=str(yahoo_snapshot.get("error") or "")
+        try:
+            ts=datetime.fromisoformat(yahoo_collected_at.replace("Z","+00:00"))
+            age_seconds=max(0,(datetime.now(timezone.utc)-ts).total_seconds())
+        except Exception:
+            age_seconds=None
+        if age_seconds is not None and age_seconds > 1800:
+            warning+=f'<div class="notice"><strong>Yahoo Collector:</strong> Snapshot is stale ({age_seconds/60:.0f} minutes old) · {html.escape(yahoo_collector_name)}</div><br>'
+        if yahoo_collector_error:
+            warning+=f'<div class="notice"><strong>Yahoo Collector:</strong> {html.escape(yahoo_collector_error)}</div><br>'
+    else:
+        warning+='<div class="notice"><strong>Yahoo Collector:</strong> No local collector snapshot has been received yet.</div><br>'
 
     quality_class='ok' if calc['complete'] else 'bad'
     body=f'''<h1>RPD Fortress Fund — Yahoo Daily Return</h1>
@@ -641,13 +702,13 @@ def daily_return_page(request:Request):
 <div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div>
 <div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div>
 <div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${baseline['nav_usd']:,.2f}</div><div class="muted">Report {html.escape(baseline['report_date'])}</div></div>
-<div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo current marks</div></div>
+<div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div>
 </div>
 {warning}
 <div class="card">
 <div class="muted">Daily Return baseline — completely separate from Bloomberg</div>
 <strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
-<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark = Yahoo Options Chain Bid/Ask midpoint when both are available; if Bid is zero/unavailable and Ask is available, Ask/2; otherwise Yahoo Options Chain Last. Exact option-contract quotes are cached for 15 minutes to avoid Yahoo rate limiting. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
+<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark is supplied by the local Yahoo Collector: Bid/Ask midpoint when both are available; if Bid is zero/unavailable and Ask is available, Ask/2; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
@@ -922,6 +983,102 @@ async def daily_return_upload(request:Request,file:UploadFile=File(...)):
 def collector_auth(request):
     if not COLLECTOR_TOKEN or not hmac.compare_digest(request.headers.get("authorization",""),f"Bearer {COLLECTOR_TOKEN}"):
         raise HTTPException(401,"Bad collector token")
+
+
+@app.get("/api/yahoo-collector/ping")
+def yahoo_collector_ping(request:Request):
+    collector_auth(request)
+    return {"ok":True,"service":"yahoo-local-collector"}
+
+@app.get("/api/yahoo-collector/config")
+def yahoo_collector_config(request:Request):
+    """Return the active Daily Return baseline positions to the local Yahoo collector."""
+    collector_auth(request)
+    with SessionLocal() as db:
+        b=_active_daily_baseline(db)
+        if not b:
+            return {
+                "version":0,
+                "baseline_id":None,
+                "report_date":None,
+                "positions":[],
+            }
+
+        dbpos=db.query(DailyReturnPosition).filter_by(
+            baseline_id=b.id
+        ).order_by(DailyReturnPosition.id).all()
+
+        positions=[]
+        for p in dbpos:
+            if str(p.instrument_type or "").upper()!="OPTION":
+                continue
+            positions.append({
+                "id":p.id,
+                "ticker":p.ticker,
+                "expiry":p.expiry,
+                "option_type":p.option_type,
+                "strike":p.strike,
+                "quantity":p.quantity,
+                "multiplier":p.multiplier,
+            })
+
+        return {
+            "version":int(b.id),
+            "baseline_id":b.id,
+            "report_date":b.report_date,
+            "nav_usd":float(b.nav_usd or 0),
+            "positions":positions,
+        }
+
+@app.post("/api/yahoo-collector/snapshot")
+async def yahoo_collector_snapshot(request:Request):
+    """Store the latest local Yahoo option-chain snapshot in Settings."""
+    collector_auth(request)
+    data=await request.json()
+
+    if not isinstance(data,dict):
+        raise HTTPException(400,"Invalid snapshot payload.")
+
+    positions=data.get("positions")
+    if not isinstance(positions,list):
+        raise HTTPException(400,"positions must be a list.")
+
+    # Keep payload intentionally small and derived only.
+    cleaned=[]
+    for r in positions[:200]:
+        if not isinstance(r,dict):
+            continue
+        cleaned.append({
+            "symbol":str(r.get("symbol") or "")[:64],
+            "ticker":str(r.get("ticker") or "")[:30],
+            "expiry":str(r.get("expiry") or "")[:10],
+            "option_type":str(r.get("option_type") or "")[:4],
+            "strike":r.get("strike"),
+            "bid":r.get("bid"),
+            "ask":r.get("ask"),
+            "last":r.get("last"),
+            "mark":r.get("mark"),
+            "source":str(r.get("source") or "")[:80],
+            "note":str(r.get("note") or "")[:160],
+        })
+
+    stored={
+        "collector_name":str(data.get("collector_name") or "Yahoo-PC")[:80],
+        "baseline_id":data.get("baseline_id"),
+        "config_version":data.get("config_version"),
+        "collected_at_utc":str(data.get("collected_at_utc") or utcnow().isoformat()),
+        "coverage_valid":int(data.get("coverage_valid") or 0),
+        "coverage_total":int(data.get("coverage_total") or len(cleaned)),
+        "error":str(data.get("error") or "")[:1000],
+        "positions":cleaned,
+    }
+
+    with SessionLocal() as db:
+        set_setting(db,"yahoo_collector_snapshot",json.dumps(stored))
+        set_setting(db,"yahoo_collector_updated_at",stored["collected_at_utc"])
+        db.commit()
+
+    return {"ok":True,"positions_received":len(cleaned)}
 
 @app.get("/api/collector/ping")
 def collector_ping(request:Request):
