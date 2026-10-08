@@ -180,7 +180,7 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
             continue
 
         upper = name.upper().strip()
-        if upper in {"CLOSED", "FGTXX", "USD", "CASH"}:
+        if upper in {"CLOSED", "FGTXX", "MPFXX", "USD", "CASH"}:
             continue
 
         price = _num(_cell(line, cols, "Price"))
@@ -210,7 +210,15 @@ def parse_nirvana_pnl_pdf(data: bytes) -> dict:
             })
             continue
 
-        ticker = upper.split()[0]
+        # Nirvana sometimes prints the security name instead of the ticker.
+        # Keep explicit aliases here so the Daily Return collectors request the
+        # actual market symbol.
+        if upper.startswith("ISHARES 20+ YEAR TREASURY BOND"):
+            ticker = "TLT"
+        elif upper.startswith("ZOOMINFO TECHNOLOGIES INC"):
+            ticker = "GTM"
+        else:
+            ticker = upper.split()[0]
         if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", ticker):
             positions.append({
                 "security_name": name.strip(),

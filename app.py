@@ -1,8 +1,10 @@
 from __future__ import annotations
-import os,json,hmac,html,uuid,re
+import os,json,hmac,html,uuid,re,math
 from datetime import datetime,timezone,date
 from zoneinfo import ZoneInfo
 from urllib.parse import quote,unquote
+from io import BytesIO
+from openpyxl import load_workbook
 from fastapi import FastAPI,Request,Form,UploadFile,File,HTTPException
 from fastapi.responses import HTMLResponse,RedirectResponse
 
@@ -13,12 +15,12 @@ from daily_return import parse_nirvana_pnl_pdf,calculate_mark_to_market_return,a
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="Fortress Delta Dashboard v4.0 — Yahoo Local Collector",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v5.0 — Fortress + Opportunity",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
     with SessionLocal() as db:
-        defaults={"portfolio_name":"RPD Fortress Fund","nav_usd":"46865138.06795","limit_pct":"15.0","config_version":"1","config_updated_at":utcnow().isoformat()}
+        defaults={"portfolio_name":"RPD Fortress Fund","nav_usd":"46865138.06795","limit_pct":"15.0","config_version":"1","config_updated_at":utcnow().isoformat(),"opportunity_config_version":"1","opportunity_limit_pct":""}
         for k,v in defaults.items():
             if db.get(Setting,k) is None: db.add(Setting(key=k,value=v))
         if db.query(Position).count()==0:
@@ -55,30 +57,30 @@ def page(title,body,user=None,refresh=None):
     adminlink='<a href="/admin">Admin</a>' if user and user["username"]==ADMIN_USER else ""
     if user:
         auth=(
-            f'<span>{html.escape(user["username"])}</span> '
-            f'<a href="/overview">Overview</a> '
-            f'<a href="/">Bloomberg Delta Monitor</a> '
-            f'<a href="/bloomberg-daily-return">Bloomberg Daily Return</a> '
-            f'<a href="/daily-return">Yahoo Daily Return</a> '
-            f'{adminlink} <a href="/logout">Logout</a>'
+            f'<a href="/overview">Overview</a>'
+            f'<a href="/">Fortress Bloomberg</a>'
+            f'<a href="/bloomberg-daily-return">Fortress Daily Return</a>'
+            f'<a href="/daily-return">Fortress Yahoo</a>'
+            f'<a href="/opportunity">Opportunity Bloomberg</a>'
+            f'<a href="/opportunity/bloomberg-daily-return">Opportunity Daily Return</a>'
+            f'<a href="/opportunity/yahoo-daily-return">Opportunity Yahoo</a>'
+            f'{adminlink}<a href="/logout">Logout</a>'
+            f'<span class="nav-user">{html.escape(user["username"])}</span>'
         )
     else:
         auth=""
     rf=f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">{rf}<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title><style>
-body{{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#172033}}.wrap{{max-width:1280px;margin:auto;padding:22px}}
-nav{{display:flex;justify-content:space-between;margin-bottom:18px}}nav a{{margin-left:12px}}.brand{{color:#172033;text-decoration:none}}.card{{background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:16px;margin-bottom:14px}}
-.grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}}.metric .v{{font-size:25px;font-weight:700;margin-top:6px}}.muted{{color:#6d7b92;font-size:13px}}
-.ok{{color:#067647}}.bad{{color:#b42318}}.notice{{padding:10px 12px;background:#fff7e6;border:1px solid #ffd591;border-radius:8px}}
-table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #e6ebf2;padding:9px;text-align:right;font-size:13px}}th:first-child,td:first-child{{text-align:left}}
-input,select,button{{padding:8px;border:1px solid #c9d3e1;border-radius:7px}}button{{background:#172b4d;color:white;cursor:pointer}}.danger{{background:#b42318}}.secondary{{background:#52657d}}
-.row{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}label{{display:flex;flex-direction:column;font-size:12px;color:#52657d;gap:4px}}
-@media(max-width:900px){{.grid{{grid-template-columns:1fr 1fr}}}}
-</style></head><body><div class="wrap"><nav><strong><a class="brand" href="/">Fortress Delta Monitor</a></strong><div>{auth}</div></nav>{body}</div></body></html>""")
+*{{box-sizing:border-box}}body{{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#172033}}.wrap{{max-width:1600px;margin:auto;padding:24px 28px 40px}}
+.topbar{{background:#142b4d;color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12)}}.topinner{{max-width:1600px;margin:auto;padding:0 28px;display:flex;align-items:center;min-height:58px;gap:22px}}.brand{{color:#fff;text-decoration:none;font-size:20px;font-weight:800;white-space:nowrap;margin-right:auto}}nav{{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end}}nav a{{color:#fff;text-decoration:none;padding:19px 10px 17px;font-size:13px;border-bottom:2px solid transparent;white-space:nowrap}}nav a:hover{{border-bottom-color:#fff}}.nav-user{{font-size:12px;margin-left:8px;opacity:.9}}
+.card{{background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:16px;margin-bottom:14px}}.grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}}.metric .v{{font-size:25px;font-weight:700;margin-top:6px}}.muted{{color:#6d7b92;font-size:13px}}.ok{{color:#067647}}.bad{{color:#b42318}}.notice{{padding:10px 12px;background:#fff7e6;border:1px solid #ffd591;border-radius:8px}}
+table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #e6ebf2;padding:9px;text-align:right;font-size:13px}}th:first-child,td:first-child{{text-align:left}}input,select,button{{padding:8px;border:1px solid #c9d3e1;border-radius:7px}}button{{background:#172b4d;color:white;cursor:pointer}}.danger{{background:#b42318}}.secondary{{background:#52657d}}.row{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}label{{display:flex;flex-direction:column;font-size:12px;color:#52657d;gap:4px}}h1{{font-size:32px;margin:4px 0 26px}}h2{{color:#13203a}}
+@media(max-width:1250px){{.topinner{{align-items:flex-start;padding-top:8px;padding-bottom:8px}}nav a{{padding:8px 7px}}.grid{{grid-template-columns:repeat(2,1fr)}}}}@media(max-width:760px){{.topinner{{display:block}}.brand{{display:block;padding:12px 0}}nav{{justify-content:flex-start}}.wrap{{padding:18px 14px}}.grid{{grid-template-columns:1fr}}}}
+</style></head><body><div class="topbar"><div class="topinner"><a class="brand" href="/overview">RPD Fund Management</a><nav>{auth}</nav></div></div><div class="wrap">{body}</div></body></html>""")
 
 def admin_tabs():
-    return '<p><a href="/">Dashboard</a> · <a href="/admin">Portfolio</a> · <a href="/admin/import">Nirvana Import</a> · <a href="/admin/daily-return">Daily Return Baseline</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
+    return '<p><a href="/overview">Overview</a> · <a href="/admin">Fortress Portfolio</a> · <a href="/admin/import">Fortress Nirvana Import</a> · <a href="/admin/daily-return">Fortress Daily Return</a> · <a href="/admin/opportunity">Opportunity Setup</a> · <a href="/admin/users">Viewer Users</a> · <a href="/admin/audit">Audit Log</a></p>'
 
 @app.get("/health")
 def health():return {"ok":True}
@@ -123,190 +125,268 @@ def format_new_york_time(timestamp_utc):
         return str(timestamp_utc or "")
 
 
+
+def _json_setting(db,key,default=None):
+    raw=get_setting(db,key,"")
+    if not raw:
+        return default
+    try:
+        x=json.loads(raw)
+        return x
+    except Exception:
+        return default
+
+def _set_json_setting(db,key,value):
+    set_setting(db,key,json.dumps(value,separators=(",",":")))
+
+def _opportunity_baseline(db):
+    x=_json_setting(db,"opportunity_daily_baseline",None)
+    return x if isinstance(x,dict) else None
+
+def _opportunity_exposure(db):
+    x=_json_setting(db,"opportunity_exposure_config",None)
+    return x if isinstance(x,dict) else None
+
+def _latest_opportunity_snapshot(db):
+    p=_json_setting(db,"opportunity_bloomberg_snapshot",None)
+    if not isinstance(p,dict):
+        return None,None
+    try:
+        ts=datetime.fromisoformat(str(p.get("timestamp_utc") or "").replace("Z","+00:00"))
+        age=(datetime.now(timezone.utc)-ts.astimezone(timezone.utc)).total_seconds()
+    except Exception:
+        age=999999
+    return p,age
+
+def _latest_yahoo_v2_fund_snapshot(db,fund_key):
+    root=_json_setting(db,"yahoo_collector_snapshot_v2",None)
+    if not isinstance(root,dict):
+        return None
+    funds=root.get("funds") or {}
+    x=funds.get(fund_key)
+    return x if isinstance(x,dict) else None
+
+def _quote_data_from_snapshot(snapshot):
+    out={}
+    if not snapshot:
+        return out
+    for r in snapshot.get("positions",[]) or []:
+        symbol=str(r.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        out[symbol]={
+            "mark":r.get("mark"),"bid":r.get("bid"),"ask":r.get("ask"),"last":r.get("last"),
+            "source":r.get("source") or "","note":r.get("note") or "",
+        }
+    return out
+
+def _dr_position_key(p):
+    inst=str(p.get("instrument_type") or "OPTION").upper()
+    if inst=="OPTION":
+        return ("OPTION",str(p.get("ticker") or "").upper(),str(p.get("expiry") or ""),str(p.get("option_type") or "").upper(),round(float(p.get("strike") or 0),6))
+    return ("EQUITY",str(p.get("ticker") or "").upper())
+
+def _bloomberg_mark_map(snapshot):
+    out={}
+    if not snapshot:
+        return out
+    for r in snapshot.get("positions",[]) or []:
+        try:
+            inst=str(r.get("instrument_type") or "OPTION").upper()
+            if inst=="OPTION":
+                key=("OPTION",str(r.get("ticker") or "").upper(),str(r.get("expiry") or ""),str(r.get("option_type") or "").upper(),round(float(r.get("strike") or 0),6))
+            else:
+                key=("EQUITY",str(r.get("ticker") or "").upper())
+            out[key]={
+                "mark":r.get("market_mark",r.get("option_mark")),
+                "source":r.get("market_source",r.get("option_mark_source")) or "",
+                "bid":r.get("market_bid",r.get("option_bid")),
+                "ask":r.get("market_ask",r.get("option_ask")),
+                "last":r.get("market_last",r.get("option_last")),
+            }
+        except Exception:
+            continue
+    return out
+
+def _calc_bloomberg_daily(positions,nav,snapshot,manual_field="bloomberg_manual_price"):
+    marks=_bloomberg_mark_map(snapshot)
+    total=0.0; valid=0; rows=[]
+    for p in positions:
+        q=marks.get(_dr_position_key(p),{})
+        market=q.get("mark"); source=q.get("source") or ""; manual=p.get(manual_field)
+        if source in ("PX_BID/ASK_MID","PX_ASK_HALF","EQUITY_BID/ASK_MID") and market is not None:
+            current=float(market); eff="BLOOMBERG MID" if source!="PX_ASK_HALF" else "BLOOMBERG ASK/2"
+        elif manual is not None:
+            current=float(manual); eff="MANUAL OVERRIDE"
+        elif market is not None:
+            current=float(market); eff="BLOOMBERG LAST"
+        else:
+            current=None; eff="UNAVAILABLE"
+        prev=p.get("baseline_price"); pnl=chg=contrib=None
+        if current is not None and prev is not None:
+            chg=current-float(prev); pnl=chg*float(p.get("quantity") or 0)*float(p.get("multiplier") or 1); total+=pnl; valid+=1
+            contrib=pnl/float(nav)*100 if nav else None
+        rows.append({**p,"market_mark":market,"market_source":source,"bid":q.get("bid"),"ask":q.get("ask"),"last":q.get("last"),"current_mark":current,"effective_source":eff,"change":chg,"estimated_pnl":pnl,"contribution_pct":contrib})
+    n=len(positions)
+    return {"rows":rows,"estimated_pnl":total,"estimated_return_pct":total/float(nav)*100 if nav else 0.0,"coverage_valid":valid,"coverage_total":n,"complete":bool(n and valid==n)}
+
+def _opp_limit(db):
+    raw=str(get_setting(db,"opportunity_limit_pct","") or "").strip()
+    try:return float(raw) if raw else None
+    except Exception:return None
+
+def _bump_opportunity_config(db,actor,reason):
+    v=int(get_setting(db,"opportunity_config_version","1") or 1)+1
+    set_setting(db,"opportunity_config_version",v)
+    audit(db,actor,"OPPORTUNITY_CONFIG_PUBLISHED",f"v{v}: {reason}")
+    return v
+
+def _parse_opportunity_exposure_xlsx(data:bytes,filename:str="Exposure.xlsx"):
+    wb=load_workbook(BytesIO(data),read_only=True,data_only=True)
+    ws=wb.active
+    vals=list(ws.iter_rows(values_only=True))
+    header_i=None
+    for i,row in enumerate(vals):
+        if row and str(row[0] or "").strip()=="Symbol" and any(str(x or "").strip()=="Delta" for x in row):
+            header_i=i;break
+    if header_i is None:
+        raise ValueError("Could not locate Exposure Summary header row.")
+    headers=[str(x or "").strip() for x in vals[header_i]]
+    hm={h:i for i,h in enumerate(headers)}
+    report_date=""
+    for row in vals[:header_i]:
+        line=" ".join(str(x or "") for x in row)
+        m=re.search(r"Report Date:\s*(\d{1,2}/\d{1,2}/\d{4})",line,re.I)
+        if m:
+            report_date=datetime.strptime(m.group(1),"%m/%d/%Y").date().isoformat();break
+    nav=None; positions=[]; seen=set()
+    month_codes="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for row in vals[header_i+1:]:
+        sym=str(row[hm["Symbol"]] or "").strip()
+        if not sym:continue
+        if sym.startswith("Grand Total"):
+            try: nav=float(row[hm["NAV"]])
+            except Exception: nav=None
+            continue
+        try: qty=float(row[hm["Position"]])
+        except Exception: continue
+        try: delta=float(row[hm["Delta"]])
+        except Exception: continue
+        if abs(qty)<1e-12: continue
+        if sym.startswith("O:"):
+            m=re.match(r"^O:([^ ]+)\s+(\d{2})([A-X])([0-9.]+)D(\d{1,2})$",sym,re.I)
+            if not m: continue
+            ticker=m.group(1).upper(); code=m.group(3).upper(); strike=float(m.group(4))
+            typ="C" if "A"<=code<="L" else "P"
+            expv=row[hm["Expiration Date"]]
+            if hasattr(expv,"date"): expiry=expv.date().isoformat()
+            else:
+                try: expiry=datetime.strptime(str(expv)[:10],"%Y-%m-%d").date().isoformat()
+                except Exception: continue
+            key=("OPTION",ticker,expiry,typ,round(strike,6),round(qty,6))
+            if key in seen:continue
+            seen.add(key)
+            positions.append({"id":len(positions)+1,"instrument_type":"OPTION","ticker":ticker,"expiry":expiry,"option_type":typ,"strike":strike,"quantity":qty,"multiplier":100.0,"bloomberg_security":option_security(ticker,expiry,typ,strike),"underlying_security":f"{ticker} US Equity","nirvana_delta":delta})
+        elif abs(delta-1.0)<1e-9:
+            ticker=sym.upper()
+            key=("CASH" if ticker in {"FGTXX","MPFXX"} else "EQUITY",ticker,round(qty,6))
+            if key in seen:continue
+            seen.add(key)
+            if ticker in {"FGTXX","MPFXX"}:
+                positions.append({"id":len(positions)+1,"instrument_type":"FIXED","ticker":ticker,"expiry":"","option_type":"","strike":None,"quantity":qty,"multiplier":1.0,"bloomberg_security":"","underlying_security":"","fixed_price":1.0,"fixed_delta":1.0,"nirvana_delta":delta})
+            else:
+                positions.append({"id":len(positions)+1,"instrument_type":"EQUITY","ticker":ticker,"expiry":"","option_type":"","strike":None,"quantity":qty,"multiplier":1.0,"bloomberg_security":f"{ticker} US Equity","underlying_security":f"{ticker} US Equity","nirvana_delta":delta})
+    if nav is None or nav<=0: raise ValueError("Could not read Grand Total NAV from exposure report.")
+    if not positions: raise ValueError("No detailed Opportunity exposure positions were parsed.")
+    return {"filename":filename,"report_date":report_date,"nav_usd":nav,"positions":positions}
+
+def _opp_baseline_positions_for_calc(b):
+    return list((b or {}).get("positions") or [])
+
+def _market_config_position_from_daily(p):
+    inst=str(p.get("instrument_type") or "OPTION").upper(); ticker=str(p.get("ticker") or "").upper()
+    if inst=="OPTION":
+        return {"instrument_type":"OPTION","ticker":ticker,"expiry":p.get("expiry") or "","option_type":p.get("option_type") or "","strike":p.get("strike"),"quantity":p.get("quantity"),"multiplier":p.get("multiplier",100),"bloomberg_security":option_security(ticker,p.get("expiry") or "",p.get("option_type") or "P",p.get("strike")),"underlying_security":f"{ticker} US Equity"}
+    return {"instrument_type":"EQUITY","ticker":ticker,"expiry":"","option_type":"","strike":None,"quantity":p.get("quantity"),"multiplier":1.0,"bloomberg_security":f"{ticker} US Equity","underlying_security":f"{ticker} US Equity"}
+
+def _merge_market_positions(delta_positions,daily_positions):
+    merged={}
+    def key(p):
+        inst=str(p.get("instrument_type") or "OPTION").upper()
+        if inst=="OPTION":return ("OPTION",str(p.get("ticker") or "").upper(),str(p.get("expiry") or ""),str(p.get("option_type") or "").upper(),round(float(p.get("strike") or 0),6))
+        return (inst,str(p.get("ticker") or "").upper())
+    for p in delta_positions or []:
+        x=dict(p);x["use_for_delta"]=True;x["use_for_daily_return"]=False;merged[key(x)]=x
+    for p in daily_positions or []:
+        x=_market_config_position_from_daily(p);k=key(x)
+        if k in merged: merged[k]["use_for_daily_return"]=True
+        else:
+            x["use_for_delta"]=False;x["use_for_daily_return"]=True;merged[k]=x
+    out=[]
+    for i,x in enumerate(merged.values(),1):
+        x=dict(x);x["id"]=x.get("id") or i;out.append(x)
+    return out
 @app.get("/overview")
 def overview(request:Request):
     u=require_user(request)
-
     with SessionLocal() as db:
-        # ----- Delta summary -----
-        p,age=latest_snapshot(db)
-        cfg=int(get_setting(db,"config_version","1"))
-        limit=float(get_setting(db,"limit_pct","15"))
-        if p:
-            mode=p.get("mode","LIVE")
-            closed=(mode=="MARKET_CLOSED")
-            stale=(age>STALE_AFTER_SECONDS) and not closed
-            delta_status="MARKET CLOSED" if closed else ("OFFLINE / STALE" if stale else mode)
-            delta_sub="Final closing snapshot" if closed else f"Age {age:.1f}s"
-            delta_pct=float(p.get("delta_exposure_pct",0) or 0)
-            delta_usd=float(p.get("delta_exposure_usd",0) or 0)
-            delta_buffer=float(p.get("buffer_pct",limit-delta_pct) or 0)
-            cov=p.get("coverage",{}) or {}
-            delta_cov=f'{cov.get("valid",0)}/{cov.get("total",0)}'
-            collector_cfg=p.get("config_version","—")
+        # Fortress delta
+        fp,fage=latest_snapshot(db); fcfg=int(get_setting(db,"config_version","1")); flimit=float(get_setting(db,"limit_pct","15"))
+        if fp:
+            fm=fp.get("mode","LIVE"); fclosed=fm=="MARKET_CLOSED"; fstale=(fage>STALE_AFTER_SECONDS) and not fclosed
+            fdelta_status="MARKET CLOSED" if fclosed else ("OFFLINE / STALE" if fstale else fm); fdelta_sub="Final closing snapshot" if fclosed else f"Age {fage:.1f}s"
+            fdelta_pct=float(fp.get("delta_exposure_pct",0) or 0); fdelta_usd=float(fp.get("delta_exposure_usd",0) or 0); fcov=fp.get("coverage",{}) or {}; fdelta_cov=f'{fcov.get("valid",0)}/{fcov.get("total",0)}'; fcollector=fp.get("config_version","—")
+            fbuffer=fp.get("buffer_pct"); fbuffer=float(fbuffer) if fbuffer is not None else flimit-fdelta_pct
         else:
-            delta_status="WAITING"
-            delta_sub="No collector snapshot"
-            delta_pct=0.0
-            delta_usd=0.0
-            delta_buffer=limit
-            delta_cov="0/0"
-            collector_cfg="—"
+            fdelta_status="WAITING";fdelta_sub="No collector snapshot";fdelta_pct=fdelta_usd=0.0;fdelta_cov="0/0";fcollector="—";fbuffer=flimit
 
-        # ----- Shared daily-return baseline -----
-        b=_active_daily_baseline(db)
-        if b:
-            dbpos=db.query(DailyReturnPosition).filter_by(
-                baseline_id=b.id
-            ).order_by(DailyReturnPosition.id).all()
-            baseline_nav=float(b.nav_usd or 0)
-            report_date=str(b.report_date or "—")
-
-            yahoo_positions=[{
-                "id":x.id,
-                "security_name":x.security_name,
-                "instrument_type":x.instrument_type,
-                "ticker":x.ticker,
-                "expiry":x.expiry,
-                "option_type":x.option_type,
-                "strike":x.strike,
-                "quantity":x.quantity,
-                "multiplier":x.multiplier,
-                "baseline_price":x.baseline_price,
-                "baseline_market_value":x.baseline_market_value,
-                "yahoo_manual_price":x.yahoo_manual_price,
-                "bloomberg_manual_price":x.bloomberg_manual_price,
-            } for x in dbpos]
-
-            yahoo_snapshot=_latest_yahoo_collector_snapshot(db)
-            yahoo_quote_data=_yahoo_quote_data_from_snapshot(yahoo_snapshot)
-            ycalc=calculate_mark_to_market_return(
-                yahoo_positions,
-                baseline_nav,
-                quote_data=yahoo_quote_data,
-            )
-            yahoo_pnl=float(ycalc.get("estimated_pnl") or 0)
-            yahoo_ret=float(ycalc.get("estimated_return_pct") or 0)
-            yahoo_cov=f'{int(ycalc.get("coverage_valid") or 0)}/{int(ycalc.get("coverage_total") or 0)}'
-            yahoo_status="FULL" if ycalc.get("complete") else "PARTIAL"
-
-            # Bloomberg summary uses the same current snapshot and same v2.9
-            # effective-price priority: MID -> ASK/2 -> manual on LAST -> LAST.
-            bloomberg_pnl=0.0
-            bloomberg_valid=0
-            bloomberg_total=len(dbpos)
-
-            mark_map={}
-            if p:
-                for r in p.get("positions",[]) or []:
-                    try:
-                        key=(
-                            str(r.get("ticker","")).upper(),
-                            str(r.get("expiry","")),
-                            str(r.get("option_type","")).upper(),
-                            round(float(r.get("strike")),6),
-                        )
-                        mark_map[key]=r
-                    except Exception:
-                        pass
-
-            for x in dbpos:
-                try:
-                    key=(
-                        str(x.ticker or "").upper(),
-                        str(x.expiry or ""),
-                        str(x.option_type or "").upper(),
-                        round(float(x.strike),6),
-                    )
-                except Exception:
-                    continue
-                q=mark_map.get(key,{})
-                market=q.get("option_mark")
-                source=q.get("option_mark_source") or ""
-                manual=x.bloomberg_manual_price
-
-                if source in ("PX_BID/ASK_MID","PX_ASK_HALF") and market is not None:
-                    current=float(market)
-                elif manual is not None:
-                    current=float(manual)
-                elif market is not None:
-                    current=float(market)
-                else:
-                    current=None
-
-                previous=float(x.baseline_price) if x.baseline_price is not None else None
-                if current is not None and previous is not None:
-                    bloomberg_pnl+=(current-previous)*float(x.quantity or 0)*float(x.multiplier or 1)
-                    bloomberg_valid+=1
-
-            bloomberg_ret=(bloomberg_pnl/baseline_nav*100.0) if baseline_nav else 0.0
-            bloomberg_cov=f"{bloomberg_valid}/{bloomberg_total}"
-            bloomberg_status="FULL" if bloomberg_total and bloomberg_valid==bloomberg_total else "PARTIAL"
+        # Fortress daily summaries
+        fb=_active_daily_baseline(db)
+        if fb:
+            fdb=db.query(DailyReturnPosition).filter_by(baseline_id=fb.id).order_by(DailyReturnPosition.id).all()
+            fpos=[{"id":x.id,"security_name":x.security_name,"instrument_type":x.instrument_type,"ticker":x.ticker,"expiry":x.expiry,"option_type":x.option_type,"strike":x.strike,"quantity":x.quantity,"multiplier":x.multiplier,"baseline_price":x.baseline_price,"baseline_market_value":x.baseline_market_value,"yahoo_manual_price":x.yahoo_manual_price,"bloomberg_manual_price":x.bloomberg_manual_price} for x in fdb]
+            fnav=float(fb.nav_usd or 0); freport=str(fb.report_date or "—")
+            fys=_latest_yahoo_v2_fund_snapshot(db,"fortress") or _latest_yahoo_collector_snapshot(db)
+            fycalc=calculate_mark_to_market_return(fpos,fnav,quote_data=_quote_data_from_snapshot(fys)); fy_pnl=float(fycalc.get("estimated_pnl") or 0);fy_ret=float(fycalc.get("estimated_return_pct") or 0);fy_cov=f'{fycalc.get("coverage_valid",0)}/{fycalc.get("coverage_total",0)}';fy_status="FULL" if fycalc.get("complete") else "PARTIAL"
+            fbcalc=_calc_bloomberg_daily(fpos,fnav,fp);fb_pnl=float(fbcalc["estimated_pnl"]);fb_ret=float(fbcalc["estimated_return_pct"]);fb_cov=f'{fbcalc["coverage_valid"]}/{fbcalc["coverage_total"]}';fb_status="FULL" if fbcalc["complete"] else "PARTIAL"
         else:
-            baseline_nav=0.0
-            report_date="—"
-            yahoo_pnl=yahoo_ret=0.0
-            yahoo_cov="0/0"
-            yahoo_status="NO BASELINE"
-            bloomberg_pnl=bloomberg_ret=0.0
-            bloomberg_cov="0/0"
-            bloomberg_status="NO BASELINE"
+            fnav=0;freport="—";fy_pnl=fy_ret=fb_pnl=fb_ret=0;fy_cov=fb_cov="0/0";fy_status=fb_status="NO BASELINE"
 
-    def sign_class(v):
-        return "ok" if v>=0 else "bad"
+        # Opportunity delta
+        op,oage=_latest_opportunity_snapshot(db); ocfg=int(get_setting(db,"opportunity_config_version","1") or 1); olimit=_opp_limit(db)
+        if op:
+            om=op.get("mode","LIVE"); oclosed=om=="MARKET_CLOSED"; ostale=(oage>STALE_AFTER_SECONDS) and not oclosed
+            odelta_status="MARKET CLOSED" if oclosed else ("OFFLINE / STALE" if ostale else om); odelta_sub="Final closing snapshot" if oclosed else f"Age {oage:.1f}s"
+            odelta_pct=float(op.get("delta_exposure_pct",0) or 0);odelta_usd=float(op.get("delta_exposure_usd",0) or 0);ocov=op.get("coverage",{}) or {};odelta_cov=f'{ocov.get("valid",0)}/{ocov.get("total",0)}';ocollector=op.get("config_version","—"); obuffer=op.get("buffer_pct")
+            if obuffer is not None: obuffer=float(obuffer)
+        else:
+            odelta_status="WAITING";odelta_sub="No collector snapshot";odelta_pct=odelta_usd=0.0;odelta_cov="0/0";ocollector="—";obuffer=None
 
-    body=f"""
-    <style>
-      .overview-section{{margin-top:22px}}
-      .overview-head{{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-bottom:10px}}
-      .overview-head h2{{margin:0;font-size:22px}}
-      .overview-head a{{white-space:nowrap}}
-      .overview-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px}}
-      .overview-card{{background:white;border:1px solid #dfe5ee;border-radius:16px;padding:18px;min-width:0}}
-      .overview-label{{font-size:14px;color:#71809a;margin-bottom:8px}}
-      .overview-value{{font-size:28px;font-weight:800;line-height:1.05;color:#13203a}}
-      .overview-sub{{font-size:14px;color:#71809a;margin-top:7px}}
-      .overview-value.ok{{color:#087f57}}
-      .overview-value.bad{{color:#a52828}}
-      @media(max-width:1100px){{.overview-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
-      @media(max-width:700px){{.overview-grid{{grid-template-columns:1fr}}.overview-value{{font-size:24px}}}}
-    </style>
+        ob=_opportunity_baseline(db)
+        if ob:
+            opos=_opp_baseline_positions_for_calc(ob);onav=float(ob.get("nav_usd") or 0);oreport=str(ob.get("report_date") or "—")
+            oys=_latest_yahoo_v2_fund_snapshot(db,"opportunity"); oycalc=calculate_mark_to_market_return(opos,onav,quote_data=_quote_data_from_snapshot(oys));oy_pnl=float(oycalc.get("estimated_pnl") or 0);oy_ret=float(oycalc.get("estimated_return_pct") or 0);oy_cov=f'{oycalc.get("coverage_valid",0)}/{oycalc.get("coverage_total",0)}';oy_status="FULL" if oycalc.get("complete") else "PARTIAL"
+            obcalc=_calc_bloomberg_daily(opos,onav,op);ob_pnl=float(obcalc["estimated_pnl"]);ob_ret=float(obcalc["estimated_return_pct"]);ob_cov=f'{obcalc["coverage_valid"]}/{obcalc["coverage_total"]}';ob_status="FULL" if obcalc["complete"] else "PARTIAL"
+        else:
+            onav=0;oreport="—";oy_pnl=oy_ret=ob_pnl=ob_ret=0;oy_cov=ob_cov="0/0";oy_status=ob_status="NO BASELINE"
 
-    <h1>RPD Fortress Fund — Overview</h1>
+    def cls(v): return "ok" if v>=0 else "bad"
+    def limit_txt(x): return "—" if x is None else f"{x:.3f}%"
+    def buffer_txt(x): return "—" if x is None else f"{x:+.3f}%"
+    def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov):
+        return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2></div>
+        <div class="summarypanel"><div class="panelhead"><h3>Bloomberg Delta Monitor</h3><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
+        <div class="mini"><span>Feed</span><b class="ok">{html.escape(dstatus)}</b><small>{html.escape(dsub)}</small></div><div class="mini"><span>Delta Exposure</span><b>{dpct:.3f}%</b><small>${dusd:,.0f}</small></div><div class="mini"><span>Limit</span><b>{limit_txt(limit)}</b></div><div class="mini"><span>Buffer</span><b class="{cls(buffer or 0) if buffer is not None else ''}">{buffer_txt(buffer)}</b></div><div class="mini"><span>Coverage</span><b>{dcov}</b><small>Collector v{collector} / Portal v{portalv}</small></div></div></div>
+        <div class="summarypanel"><div class="panelhead"><h3>Bloomberg Daily Return</h3><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
+        <div class="mini"><span>Status</span><b class="ok">{bd_status}</b><small>Bloomberg marks</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(bd_ret)}">{bd_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(bd_pnl)}">${bd_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{bd_cov}</b><small>Bloomberg marks</small></div></div></div>
+        <div class="summarypanel"><div class="panelhead"><h3>Yahoo Daily Return</h3><a href="{y_link}">Open details →</a></div><div class="mini-grid">
+        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div></section>'''
 
-    <div class="overview-section">
-      <div class="overview-head"><h2>Bloomberg Delta Monitor</h2><a href="/">Open full monitor →</a></div>
-      <div class="overview-grid">
-        <div class="overview-card"><div class="overview-label">Feed</div><div class="overview-value ok">{html.escape(delta_status)}</div><div class="overview-sub">{html.escape(delta_sub)}</div></div>
-        <div class="overview-card"><div class="overview-label">Delta Exposure</div><div class="overview-value">{delta_pct:.3f}%</div><div class="overview-sub">${delta_usd:,.0f}</div></div>
-        <div class="overview-card"><div class="overview-label">Limit</div><div class="overview-value">{limit:.3f}%</div></div>
-        <div class="overview-card"><div class="overview-label">Buffer</div><div class="overview-value {sign_class(delta_buffer)}">{delta_buffer:+.3f}%</div></div>
-        <div class="overview-card"><div class="overview-label">Coverage</div><div class="overview-value">{delta_cov}</div><div class="overview-sub">Collector v{collector_cfg} / Portal v{cfg}</div></div>
-      </div>
-    </div>
-
-    <div class="overview-section">
-      <div class="overview-head"><h2>Bloomberg Daily Return</h2><a href="/bloomberg-daily-return">Open details →</a></div>
-      <div class="overview-grid">
-        <div class="overview-card"><div class="overview-label">Status</div><div class="overview-value ok">{bloomberg_status}</div><div class="overview-sub">Bloomberg marks</div></div>
-        <div class="overview-card"><div class="overview-label">Estimated Daily Return</div><div class="overview-value {sign_class(bloomberg_ret)}">{bloomberg_ret:+.4f}%</div></div>
-        <div class="overview-card"><div class="overview-label">Estimated P&amp;L</div><div class="overview-value {sign_class(bloomberg_pnl)}">${bloomberg_pnl:+,.2f}</div></div>
-        <div class="overview-card"><div class="overview-label">Baseline NAV</div><div class="overview-value">${baseline_nav:,.2f}</div><div class="overview-sub">Report {html.escape(report_date)}</div></div>
-        <div class="overview-card"><div class="overview-label">Coverage</div><div class="overview-value">{bloomberg_cov}</div><div class="overview-sub">Bloomberg option marks</div></div>
-      </div>
-    </div>
-
-    <div class="overview-section">
-      <div class="overview-head"><h2>Yahoo Daily Return</h2><a href="/daily-return">Open details →</a></div>
-      <div class="overview-grid">
-        <div class="overview-card"><div class="overview-label">Status</div><div class="overview-value ok">{yahoo_status}</div><div class="overview-sub">Mark-to-market estimate</div></div>
-        <div class="overview-card"><div class="overview-label">Estimated Daily Return</div><div class="overview-value {sign_class(yahoo_ret)}">{yahoo_ret:+.4f}%</div></div>
-        <div class="overview-card"><div class="overview-label">Estimated P&amp;L</div><div class="overview-value {sign_class(yahoo_pnl)}">${yahoo_pnl:+,.2f}</div></div>
-        <div class="overview-card"><div class="overview-label">Baseline NAV</div><div class="overview-value">${baseline_nav:,.2f}</div><div class="overview-sub">Report {html.escape(report_date)}</div></div>
-        <div class="overview-card"><div class="overview-label">Coverage</div><div class="overview-value">{yahoo_cov}</div><div class="overview-sub">Yahoo current marks</div></div>
-      </div>
-    </div>
-    """
+    body=f'''<style>.funds{{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}}.fundcol{{min-width:0}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:12px}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:14px}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.mini-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:12px;min-height:98px}}.mini span,.mini small{{display:block;color:#73819a;font-size:12px}}.mini b{{display:block;font-size:21px;margin:8px 0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}}}</style>
+    <h1>RPD Fund Management — Overview</h1><div class="funds">
+    {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov)}
+    {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov)}
+    </div>'''
     return page("Overview",body,u,60)
 
 @app.get("/")
@@ -336,6 +416,138 @@ def dashboard(request:Request):
 <div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get("timestamp_utc","")))} · Collector: {html.escape(p.get("collector_id",""))}</div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>"""
         return page("Delta Monitor",body,u,3)
+
+
+@app.get("/opportunity")
+def opportunity_dashboard(request:Request):
+    u=require_user(request)
+    with SessionLocal() as db:
+        p,age=_latest_opportunity_snapshot(db);cfg=int(get_setting(db,"opportunity_config_version","1") or 1);limit=_opp_limit(db)
+        if not p:
+            return page("Opportunity Bloomberg Delta Monitor",f'<div class="card"><h1>RPD Opportunity Fund — Bloomberg Delta Monitor</h1><div class="notice">WAITING — No Opportunity collector snapshot yet.</div><p>Published config v{cfg}</p></div>',u,5)
+        mode=p.get("mode","LIVE");closed=mode=="MARKET_CLOSED";stale=(age>STALE_AFTER_SECONDS) and not closed;status="MARKET CLOSED" if closed else ("OFFLINE / STALE" if stale else mode)
+        pct=float(p.get("delta_exposure_pct",0) or 0);exp=float(p.get("delta_exposure_usd",0) or 0);buf=p.get("buffer_pct");cov=p.get("coverage",{}) or {};rows=""
+        for r in sorted([x for x in (p.get("positions",[]) or []) if x.get("use_for_delta")],key=lambda x:abs(float(x.get("contribution_pct") or 0)),reverse=True):
+            inst=str(r.get("instrument_type") or "OPTION").upper(); label=(f'{r.get("ticker","")} {r.get("expiry","")} {r.get("option_type","")}{r.get("strike")}' if inst=="OPTION" else str(r.get("ticker") or ""))
+            rows+=f'<tr><td>{html.escape(label)}</td><td>{float(r.get("quantity") or 0):,.0f}</td><td>${float(r.get("delta_exposure_usd") or 0):,.0f}</td><td>{float(r.get("contribution_pct") or 0):.3f}%</td></tr>'
+        limit_html='—' if limit is None else f'{limit:.3f}%';buf_html='—' if buf is None else f'{float(buf):+.3f}%'
+        body=f'''<h1>RPD Opportunity Fund — Bloomberg Delta Monitor</h1><div class="grid"><div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed else f'Age {age:.1f}s'}</div></div><div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div><div class="card metric"><div class="muted">Limit</div><div class="v">{limit_html}</div></div><div class="card metric"><div class="muted">Buffer</div><div class="v">{buf_html}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get('valid',0)}/{cov.get('total',0)}</div><div class="muted">Collector v{p.get('config_version')} / Portal v{cfg}</div></div></div><div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get('timestamp_utc','')))} · Collector: {html.escape(str(p.get('collector_id','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+        return page("Opportunity Bloomberg Delta Monitor",body,u,3)
+
+def _render_opportunity_yahoo(request:Request):
+    u=require_user(request)
+    with SessionLocal() as db:
+        b=_opportunity_baseline(db);snap=_latest_yahoo_v2_fund_snapshot(db,"opportunity")
+    if not b:
+        extra=' <a href="/admin/opportunity">Upload Opportunity P&amp;L Report</a>' if u["username"]==ADMIN_USER else ''
+        return page("Opportunity Yahoo Daily Return",f'<h1>RPD Opportunity Fund — Yahoo Daily Return</h1><div class="card"><div class="notice">No Opportunity P&amp;L baseline loaded.{extra}</div></div>',u)
+    positions=_opp_baseline_positions_for_calc(b);calc=calculate_mark_to_market_return(positions,float(b.get("nav_usd") or 0),quote_data=_quote_data_from_snapshot(snap));status="FULL" if calc["complete"] else "PARTIAL";ret=float(calc.get("estimated_return_pct") or 0);pnl=float(calc.get("estimated_pnl") or 0);rows=""
+    for r in calc["rows"]:
+        strike="" if r.get("strike") is None else f'{r["strike"]:g}';posname=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"]);manual=r.get("manual_price");manual_val='' if manual is None else f'{float(manual):.4f}'
+        if u["username"]==ADMIN_USER:
+            mh=f'<form method="post" action="/admin/opportunity/manual-price" style="display:flex;gap:4px"><input type="hidden" name="position_id" value="{r["id"]}"><input type="hidden" name="source" value="YAHOO"><input type="number" step="0.0001" min="0" name="price" value="{manual_val}" style="width:82px"><button>Save</button><button name="clear" value="1">Clear</button></form>'
+        else: mh='—' if not manual_val else f'${float(manual_val):.4f}'
+        fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
+        rows+=f'<tr><td>{html.escape(posname)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("previous_mark"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
+    warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Yahoo local collector has not supplied a usable current mark for every Opportunity position.</div><br>'
+    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1><div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    return page("Opportunity Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
+
+@app.get("/opportunity/yahoo-daily-return")
+def opportunity_yahoo_daily_return(request:Request): return _render_opportunity_yahoo(request)
+
+@app.get("/opportunity/bloomberg-daily-return")
+def opportunity_bloomberg_daily_return(request:Request):
+    u=require_user(request)
+    with SessionLocal() as db:
+        b=_opportunity_baseline(db);snap,age=_latest_opportunity_snapshot(db)
+    if not b:
+        extra=' <a href="/admin/opportunity">Upload Opportunity P&amp;L Report</a>' if u["username"]==ADMIN_USER else ''
+        return page("Opportunity Bloomberg Daily Return",f'<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1><div class="card"><div class="notice">No Opportunity P&amp;L baseline loaded.{extra}</div></div>',u)
+    pos=_opp_baseline_positions_for_calc(b);calc=_calc_bloomberg_daily(pos,float(b.get("nav_usd") or 0),snap);ret=float(calc["estimated_return_pct"]);pnl=float(calc["estimated_pnl"]);rows=""
+    for r in calc["rows"]:
+        strike="" if r.get("strike") is None else f'{r["strike"]:g}';name=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"]);manual=r.get("bloomberg_manual_price");mv='' if manual is None else f'{float(manual):.4f}'
+        if u["username"]==ADMIN_USER:
+            mh=f'<form method="post" action="/admin/opportunity/manual-price" style="display:flex;gap:4px"><input type="hidden" name="position_id" value="{r["id"]}"><input type="hidden" name="source" value="BLOOMBERG"><input type="number" step="0.0001" min="0" name="price" value="{mv}" style="width:82px"><button>Save</button><button name="clear" value="1">Clear</button></form>'
+        else: mh='—' if not mv else f'${float(mv):.4f}'
+        fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
+        rows+=f'<tr><td>{html.escape(name)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("baseline_price"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
+    status="FULL" if calc["complete"] else "PARTIAL";warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Bloomberg has not supplied a usable current mark for every Opportunity position.</div><br>'
+    body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1><div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    return page("Opportunity Bloomberg Daily Return",body,u,60 if auto_refresh_allowed() else None)
+
+@app.get("/admin/opportunity")
+def opportunity_admin(request:Request):
+    u=require_admin(request)
+    with SessionLocal() as db:
+        exp=_opportunity_exposure(db);base=_opportunity_baseline(db);limit=get_setting(db,"opportunity_limit_pct","");ver=get_setting(db,"opportunity_config_version","1")
+    exp_txt='<p>No Opportunity Exposure report loaded.</p>' if not exp else f'<div class="notice"><strong>Exposure:</strong> {html.escape(str(exp.get("filename") or ""))} · Report {html.escape(str(exp.get("report_date") or ""))} · NAV ${float(exp.get("nav_usd") or 0):,.2f} · Delta positions {len(exp.get("positions") or [])}</div>'
+    base_txt='<p>No Opportunity P&amp;L baseline loaded.</p>' if not base else f'<div class="notice"><strong>P&amp;L baseline:</strong> {html.escape(str(base.get("filename") or ""))} · Report {html.escape(str(base.get("report_date") or ""))} · NAV ${float(base.get("nav_usd") or 0):,.2f} · Daily Return positions {len(base.get("positions") or [])}</div>'
+    body=admin_tabs()+f'''<h1>Opportunity Setup</h1><div class="card"><h3>Opportunity Delta Monitor</h3><p>Upload the latest Nirvana Exposure by Underlying XLSX. This updates only Opportunity.</p><form method="post" action="/admin/opportunity/exposure-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required><button>Upload Opportunity Exposure</button></form><br>{exp_txt}</div><div class="card"><h3>Opportunity Daily Return Baseline</h3><p>Upload the previous trading day's Opportunity PNL Report PDF. It supplies positions, previous marks and NAV for both Bloomberg and Yahoo Daily Return.</p><form method="post" action="/admin/opportunity/pnl-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload Opportunity P&amp;L</button></form><br>{base_txt}</div><div class="card"><h3>Opportunity Settings — Config v{html.escape(str(ver))}</h3><form method="post" action="/admin/opportunity/settings" class="row"><label>Delta Limit % (optional)<input name="limit_pct" value="{html.escape(str(limit or ''))}" placeholder="Leave blank if no limit"></label><button>Publish</button></form></div>'''
+    return page("Opportunity Setup",body,u)
+
+@app.post("/admin/opportunity/exposure-upload")
+async def opportunity_exposure_upload(request:Request,file:UploadFile=File(...)):
+    u=require_admin(request);filename=file.filename or "Opportunity Exposure.xlsx"
+    if not filename.lower().endswith(".xlsx"): raise HTTPException(400,"Please upload the Opportunity Exposure by Underlying XLSX.")
+    data=await file.read()
+    try: parsed=_parse_opportunity_exposure_xlsx(data,filename)
+    except Exception as e: raise HTTPException(400,f"Could not parse Opportunity Exposure: {e}")
+    with SessionLocal() as db:
+        _set_json_setting(db,"opportunity_exposure_config",parsed);_bump_opportunity_config(db,u["username"],f'Exposure {filename}; report={parsed.get("report_date")}; positions={len(parsed.get("positions") or [])}');db.commit()
+    return RedirectResponse("/admin/opportunity",303)
+
+@app.post("/admin/opportunity/pnl-upload")
+async def opportunity_pnl_upload(request:Request,file:UploadFile=File(...)):
+    u=require_admin(request);filename=file.filename or "Opportunity PNL.pdf"
+    if not filename.lower().endswith(".pdf"): raise HTTPException(400,"Please upload the Opportunity PNL Report PDF.")
+    data=await file.read()
+    try: parsed=parse_nirvana_pnl_pdf(data)
+    except Exception as e: raise HTTPException(400,f"Could not parse Opportunity PNL Report: {e}")
+    positions=[]
+    for i,x in enumerate(parsed["positions"],1):
+        positions.append({**x,"id":i,"yahoo_manual_price":None,"bloomberg_manual_price":None})
+    stored={"filename":filename,"report_date":parsed["report_date"],"run_date":parsed["run_date"],"nav_usd":parsed["nav_usd"],"positions":positions,"version":int(datetime.now(timezone.utc).timestamp())}
+    with SessionLocal() as db:
+        _set_json_setting(db,"opportunity_daily_baseline",stored);_bump_opportunity_config(db,u["username"],f'PNL baseline {filename}; report={parsed.get("report_date")}; positions={len(positions)}');db.commit()
+    return RedirectResponse("/admin/opportunity",303)
+
+@app.post("/admin/opportunity/settings")
+async def opportunity_settings(request:Request,limit_pct:str=Form("")):
+    u=require_admin(request);raw=str(limit_pct or "").strip()
+    if raw:
+        try:
+            val=float(raw)
+            if val<=0: raise ValueError
+        except Exception: raise HTTPException(400,"Opportunity limit must be positive or blank.")
+    with SessionLocal() as db:
+        set_setting(db,"opportunity_limit_pct",raw);_bump_opportunity_config(db,u["username"],f"Limit={raw or 'N/A'}");db.commit()
+    return RedirectResponse("/admin/opportunity",303)
+
+@app.post("/admin/opportunity/manual-price")
+async def opportunity_manual_price(request:Request):
+    u=require_admin(request);form=await request.form();source=str(form.get("source") or "").upper();clear=str(form.get("clear") or "")=="1"
+    try: pid=int(form.get("position_id"))
+    except Exception: raise HTTPException(400,"Invalid position id.")
+    val=None
+    if not clear:
+        try:
+            val=float(str(form.get("price") or "").strip())
+            if val<0: raise ValueError
+        except Exception: raise HTTPException(400,"Manual price must be zero or greater.")
+    with SessionLocal() as db:
+        b=_opportunity_baseline(db)
+        if not b: raise HTTPException(404,"Opportunity baseline not found.")
+        found=False
+        for p in b.get("positions",[]):
+            if int(p.get("id") or 0)==pid:
+                if source=="YAHOO": p["yahoo_manual_price"]=val;redirect="/opportunity/yahoo-daily-return"
+                elif source=="BLOOMBERG": p["bloomberg_manual_price"]=val;redirect="/opportunity/bloomberg-daily-return"
+                else: raise HTTPException(400,"Unknown source.")
+                found=True;break
+        if not found: raise HTTPException(404,"Position not found.")
+        _set_json_setting(db,"opportunity_daily_baseline",b);audit(db,u["username"],"OPPORTUNITY_MANUAL_PRICE",f"{source} position_id={pid}; price={val}");db.commit()
+    return RedirectResponse(redirect,303)
 
 @app.get("/admin")
 def admin_home(request:Request):
@@ -575,15 +787,16 @@ def _active_daily_baseline(db):
 
 
 def _latest_yahoo_collector_snapshot(db):
-    """Return the latest Yahoo local-collector snapshot stored in Settings."""
+    """Return Fortress Yahoo snapshot; prefer the multi-fund local collector."""
+    v2=_latest_yahoo_v2_fund_snapshot(db,"fortress")
+    if v2:
+        return v2
     raw=get_setting(db,"yahoo_collector_snapshot","")
     if not raw:
         return None
     try:
         data=json.loads(raw)
-        if not isinstance(data,dict):
-            return None
-        return data
+        return data if isinstance(data,dict) else None
     except Exception:
         return None
 
@@ -1010,10 +1223,9 @@ def yahoo_collector_config(request:Request):
 
         positions=[]
         for p in dbpos:
-            if str(p.instrument_type or "").upper()!="OPTION":
-                continue
             positions.append({
                 "id":p.id,
+                "instrument_type":str(p.instrument_type or "OPTION").upper(),
                 "ticker":p.ticker,
                 "expiry":p.expiry,
                 "option_type":p.option_type,
@@ -1079,6 +1291,68 @@ async def yahoo_collector_snapshot(request:Request):
         db.commit()
 
     return {"ok":True,"positions_received":len(cleaned)}
+
+
+def _fortress_daily_positions(db):
+    b=_active_daily_baseline(db)
+    if not b:return None,[]
+    dbpos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.id).all()
+    return b,[{"id":p.id,"security_name":p.security_name,"instrument_type":p.instrument_type,"ticker":p.ticker,"expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,"multiplier":p.multiplier,"baseline_price":p.baseline_price,"baseline_market_value":p.baseline_market_value,"yahoo_manual_price":p.yahoo_manual_price,"bloomberg_manual_price":p.bloomberg_manual_price} for p in dbpos]
+
+def _fortress_delta_positions(db):
+    today=date.today().isoformat();out=[]
+    for p in db.query(Position).filter_by(active=True).order_by(Position.ticker,Position.expiry,Position.strike).all():
+        if p.expiry<today:continue
+        out.append({"id":p.id,"instrument_type":"OPTION","ticker":p.ticker,"expiry":p.expiry,"option_type":p.option_type,"strike":p.strike,"quantity":p.quantity,"multiplier":p.multiplier,"bloomberg_security":p.bloomberg_security,"underlying_security":p.underlying_security})
+    return out
+
+@app.get("/api/collector/config-v2")
+def collector_config_v2(request:Request):
+    collector_auth(request)
+    with SessionLocal() as db:
+        fb,fdaily=_fortress_daily_positions(db);fdelta=_fortress_delta_positions(db);fcfg=int(get_setting(db,"config_version","1"));flimit=float(get_setting(db,"limit_pct","15"));fnav=float(get_setting(db,"nav_usd","0"))
+        ob=_opportunity_baseline(db);oe=_opportunity_exposure(db);ocfg=int(get_setting(db,"opportunity_config_version","1") or 1);olimit=_opp_limit(db)
+        opos_daily=list((ob or {}).get("positions") or []);opos_delta=list((oe or {}).get("positions") or [])
+        fmerged=_merge_market_positions(fdelta,fdaily);omerged=_merge_market_positions(opos_delta,opos_daily)
+        version=f'F{fcfg}-FB{getattr(fb,"id",0) if fb else 0}-O{ocfg}-OB{(ob or {}).get("version",0)}'
+        return {"version":version,"poll_seconds":120,"funds":{"fortress":{"fund_key":"fortress","portfolio_name":"RPD Fortress Fund","version":fcfg,"nav_usd":fnav,"limit_pct":flimit,"positions":fmerged},"opportunity":{"fund_key":"opportunity","portfolio_name":"RPD Opportunity Fund","version":ocfg,"nav_usd":float((oe or {}).get("nav_usd") or 0),"limit_pct":olimit,"positions":omerged}}}
+
+@app.post("/api/collector/snapshot-v2")
+async def collector_snapshot_v2(request:Request):
+    collector_auth(request);data=await request.json();funds=(data or {}).get("funds") or {}
+    with SessionLocal() as db:
+        fp=funds.get("fortress")
+        if isinstance(fp,dict):
+            db.add(Snapshot(payload=json.dumps(fp)));db.flush();count=db.query(Snapshot).count()
+            if count>250:
+                for x in db.query(Snapshot).order_by(Snapshot.id.asc()).limit(count-250).all():db.delete(x)
+        op=funds.get("opportunity")
+        if isinstance(op,dict): set_setting(db,"opportunity_bloomberg_snapshot",json.dumps(op))
+        db.commit()
+    return {"ok":True,"funds_received":[k for k,v in funds.items() if isinstance(v,dict)]}
+
+@app.get("/api/yahoo-collector/config-v2")
+def yahoo_collector_config_v2(request:Request):
+    collector_auth(request)
+    with SessionLocal() as db:
+        fb,fdaily=_fortress_daily_positions(db);ob=_opportunity_baseline(db);odaily=list((ob or {}).get("positions") or [])
+        def clean(rows):
+            out=[]
+            for p in rows:
+                inst=str(p.get("instrument_type") or "OPTION").upper()
+                if inst not in ("OPTION","EQUITY"):continue
+                out.append({"id":p.get("id"),"instrument_type":inst,"ticker":p.get("ticker"),"expiry":p.get("expiry") or "","option_type":p.get("option_type") or "","strike":p.get("strike"),"quantity":p.get("quantity"),"multiplier":p.get("multiplier",100 if inst=="OPTION" else 1)})
+            return out
+        version=f'FB{getattr(fb,"id",0) if fb else 0}-OB{(ob or {}).get("version",0)}'
+        return {"version":version,"funds":{"fortress":{"fund_key":"fortress","portfolio_name":"RPD Fortress Fund","baseline_id":getattr(fb,"id",None) if fb else None,"report_date":getattr(fb,"report_date",None) if fb else None,"positions":clean(fdaily)},"opportunity":{"fund_key":"opportunity","portfolio_name":"RPD Opportunity Fund","baseline_id":None,"report_date":(ob or {}).get("report_date"),"positions":clean(odaily)}}}
+
+@app.post("/api/yahoo-collector/snapshot-v2")
+async def yahoo_collector_snapshot_v2(request:Request):
+    collector_auth(request);data=await request.json()
+    if not isinstance(data,dict) or not isinstance(data.get("funds"),dict): raise HTTPException(400,"Invalid multi-fund Yahoo snapshot.")
+    with SessionLocal() as db:
+        set_setting(db,"yahoo_collector_snapshot_v2",json.dumps(data));set_setting(db,"yahoo_collector_v2_updated_at",str(data.get("collected_at_utc") or utcnow().isoformat()));db.commit()
+    return {"ok":True,"funds_received":list(data.get("funds",{}).keys())}
 
 @app.get("/api/collector/ping")
 def collector_ping(request:Request):
