@@ -15,7 +15,7 @@ from daily_return import parse_nirvana_pnl_pdf,calculate_mark_to_market_return,a
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v5.5 — Overview Panel Gaps",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v5.7 — Opportunity Delta + Delay Badges",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -242,63 +242,156 @@ def _bump_opportunity_config(db,actor,reason):
     return v
 
 def _parse_opportunity_exposure_xlsx(data:bytes,filename:str="Exposure.xlsx"):
+    """
+    Opportunity-only Exposure by Underlying parser.
+
+    Important:
+    - This function is used ONLY for Opportunity Delta / Exposure import.
+    - It does not change Fortress parsing.
+    - It does not change Opportunity/Fortress Daily Return baselines, Bid/Ask
+      logic, Yahoo snapshots, Bloomberg Daily Return, or collector behavior.
+    """
     wb=load_workbook(BytesIO(data),read_only=True,data_only=True)
-    ws=wb.active
-    vals=list(ws.iter_rows(values_only=True))
-    header_i=None
-    for i,row in enumerate(vals):
-        if row and str(row[0] or "").strip()=="Symbol" and any(str(x or "").strip()=="Delta" for x in row):
-            header_i=i;break
-    if header_i is None:
-        raise ValueError("Could not locate Exposure Summary header row.")
+
+    # Nirvana exports can change the workbook's active sheet depending on
+    # report filters. Prefer the named Exposure Summary sheet, then scan all
+    # sheets as a fallback instead of trusting wb.active.
+    sheets=[]
+    for s in wb.worksheets:
+        if str(s.title or "").strip().lower()=="exposure summary":
+            sheets.insert(0,s)
+        else:
+            sheets.append(s)
+
+    ws=None; vals=None; header_i=None
+    required_headers={"symbol","nav","position","delta"}
+    for candidate in sheets:
+        candidate_vals=list(candidate.iter_rows(values_only=True))
+        # Search generously because Nirvana may add/remove report metadata rows.
+        for i,row in enumerate(candidate_vals[:60]):
+            norm=[str(x or "").strip() for x in (row or [])]
+            norm_lower={x.lower() for x in norm if x}
+            if required_headers.issubset(norm_lower):
+                ws=candidate; vals=candidate_vals; header_i=i
+                break
+        if header_i is not None:
+            break
+
+    if ws is None or vals is None or header_i is None:
+        raise ValueError("Could not locate Opportunity Exposure Summary header row (Symbol/NAV/Position/Delta).")
+
     headers=[str(x or "").strip() for x in vals[header_i]]
-    hm={h:i for i,h in enumerate(headers)}
+    hm={h.lower():i for i,h in enumerate(headers) if h}
+    for req in ("symbol","nav","position","delta"):
+        if req not in hm:
+            raise ValueError(f"Opportunity Exposure is missing required column: {req.title()}")
+
     report_date=""
     for row in vals[:header_i]:
         line=" ".join(str(x or "") for x in row)
         m=re.search(r"Report Date:\s*(\d{1,2}/\d{1,2}/\d{4})",line,re.I)
         if m:
             report_date=datetime.strptime(m.group(1),"%m/%d/%Y").date().isoformat();break
+
     nav=None; positions=[]; seen=set()
-    month_codes="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    # Cash / money-market instruments must NOT contribute to Opportunity
+    # Bloomberg Delta Monitor. NAV is still the report's Grand Total NAV.
+    # Keeping the denominator unchanged is intentional.
+    excluded_symbols={"FGTXX","MPFXX","USD","CASH"}
+
+    exp_col=hm.get("expiration date")
+
     for row in vals[header_i+1:]:
-        sym=str(row[hm["Symbol"]] or "").strip()
-        if not sym:continue
-        if sym.startswith("Grand Total"):
-            try: nav=float(row[hm["NAV"]])
+        try:
+            sym=str(row[hm["symbol"]] or "").strip()
+        except Exception:
+            continue
+        if not sym:
+            continue
+
+        if sym.lower().startswith("grand total"):
+            try: nav=float(row[hm["nav"]])
             except Exception: nav=None
             continue
-        try: qty=float(row[hm["Position"]])
+
+        # Opportunity Delta-only filter. This does not affect Daily Return.
+        clean_sym=sym.upper().strip()
+        if clean_sym in excluded_symbols:
+            continue
+
+        try: qty=float(row[hm["position"]])
         except Exception: continue
-        try: delta=float(row[hm["Delta"]])
+        try: delta=float(row[hm["delta"]])
         except Exception: continue
-        if abs(qty)<1e-12: continue
+        if abs(qty)<1e-12:
+            continue
+
         if sym.startswith("O:"):
             m=re.match(r"^O:([^ ]+)\s+(\d{2})([A-X])([0-9.]+)D(\d{1,2})$",sym,re.I)
-            if not m: continue
+            if not m:
+                continue
             ticker=m.group(1).upper(); code=m.group(3).upper(); strike=float(m.group(4))
             typ="C" if "A"<=code<="L" else "P"
-            expv=row[hm["Expiration Date"]]
-            if hasattr(expv,"date"): expiry=expv.date().isoformat()
+            if exp_col is None:
+                continue
+            expv=row[exp_col]
+            if hasattr(expv,"date"):
+                expiry=expv.date().isoformat()
             else:
                 try: expiry=datetime.strptime(str(expv)[:10],"%Y-%m-%d").date().isoformat()
                 except Exception: continue
             key=("OPTION",ticker,expiry,typ,round(strike,6),round(qty,6))
-            if key in seen:continue
+            if key in seen:
+                continue
             seen.add(key)
-            positions.append({"id":len(positions)+1,"instrument_type":"OPTION","ticker":ticker,"expiry":expiry,"option_type":typ,"strike":strike,"quantity":qty,"multiplier":100.0,"bloomberg_security":option_security(ticker,expiry,typ,strike),"underlying_security":f"{ticker} US Equity","nirvana_delta":delta})
+            positions.append({
+                "id":len(positions)+1,
+                "instrument_type":"OPTION",
+                "ticker":ticker,
+                "expiry":expiry,
+                "option_type":typ,
+                "strike":strike,
+                "quantity":qty,
+                "multiplier":100.0,
+                "bloomberg_security":option_security(ticker,expiry,typ,strike),
+                "underlying_security":f"{ticker} US Equity",
+                "nirvana_delta":delta
+            })
+
         elif abs(delta-1.0)<1e-9:
-            ticker=sym.upper()
-            key=("CASH" if ticker in {"FGTXX","MPFXX"} else "EQUITY",ticker,round(qty,6))
-            if key in seen:continue
+            ticker=clean_sym
+            # Only real equities/ETFs remain here. Money-market/cash symbols
+            # were excluded above.
+            key=("EQUITY",ticker,round(qty,6))
+            if key in seen:
+                continue
             seen.add(key)
-            if ticker in {"FGTXX","MPFXX"}:
-                positions.append({"id":len(positions)+1,"instrument_type":"FIXED","ticker":ticker,"expiry":"","option_type":"","strike":None,"quantity":qty,"multiplier":1.0,"bloomberg_security":"","underlying_security":"","fixed_price":1.0,"fixed_delta":1.0,"nirvana_delta":delta})
-            else:
-                positions.append({"id":len(positions)+1,"instrument_type":"EQUITY","ticker":ticker,"expiry":"","option_type":"","strike":None,"quantity":qty,"multiplier":1.0,"bloomberg_security":f"{ticker} US Equity","underlying_security":f"{ticker} US Equity","nirvana_delta":delta})
-    if nav is None or nav<=0: raise ValueError("Could not read Grand Total NAV from exposure report.")
-    if not positions: raise ValueError("No detailed Opportunity exposure positions were parsed.")
-    return {"filename":filename,"report_date":report_date,"nav_usd":nav,"positions":positions}
+            positions.append({
+                "id":len(positions)+1,
+                "instrument_type":"EQUITY",
+                "ticker":ticker,
+                "expiry":"",
+                "option_type":"",
+                "strike":None,
+                "quantity":qty,
+                "multiplier":1.0,
+                "bloomberg_security":f"{ticker} US Equity",
+                "underlying_security":f"{ticker} US Equity",
+                "nirvana_delta":delta
+            })
+
+    if nav is None or nav<=0:
+        raise ValueError("Could not read Grand Total NAV from Opportunity exposure report.")
+    if not positions:
+        raise ValueError("No detailed Opportunity exposure positions were parsed.")
+
+    return {
+        "filename":filename,
+        "report_date":report_date,
+        "nav_usd":nav,
+        "positions":positions
+    }
 
 def _opp_baseline_positions_for_calc(b):
     return list((b or {}).get("positions") or [])
@@ -375,14 +468,14 @@ def overview(request:Request):
     def buffer_txt(x): return "—" if x is None else f"{x:+.3f}%"
     def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov):
         return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2></div>
-        <div class="summarypanel"><div class="panelhead"><h3>Bloomberg Delta Monitor</h3><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
+        <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Delta Monitor</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
         <div class="mini"><span>Feed</span><b class="ok">{html.escape(dstatus)}</b><small>{html.escape(dsub)}</small></div><div class="mini"><span>Delta Exposure</span><b>{dpct:.3f}%</b><small>${dusd:,.0f}</small></div><div class="mini"><span>Limit</span><b>{limit_txt(limit)}</b></div><div class="mini"><span>Buffer</span><b class="{cls(buffer or 0) if buffer is not None else ''}">{buffer_txt(buffer)}</b></div><div class="mini"><span>Coverage</span><b>{dcov}</b><small>Collector v{collector} / Portal v{portalv}</small></div></div></div>
-        <div class="summarypanel"><div class="panelhead"><h3>Bloomberg Daily Return</h3><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
+        <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Daily Return</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{bd_status}</b><small>Bloomberg marks</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(bd_ret)}">{bd_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(bd_pnl)}">${bd_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{bd_cov}</b><small>Bloomberg marks</small></div></div></div>
-        <div class="summarypanel"><div class="panelhead"><h3>Yahoo Daily Return</h3><a href="{y_link}">Open details →</a></div><div class="mini-grid">
+        <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div></section>'''
 
-    body=f'''<style>.funds{{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:stretch}}.fundcol{{min-width:0;display:grid;grid-template-rows:auto repeat(3,minmax(0,1fr));row-gap:14px;align-self:stretch}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}</style>
+    body=f'''<style>.funds{{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:stretch}}.fundcol{{min-width:0;display:grid;grid-template-rows:auto repeat(3,minmax(0,1fr));row-gap:14px;align-self:stretch}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#fff1c9;color:#805b00;border-color:#f6dda0}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}</style>
     <h1>RPD Fund Management — Overview</h1><div class="funds">
     {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov)}
     {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov)}
