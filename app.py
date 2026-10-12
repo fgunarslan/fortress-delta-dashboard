@@ -4,9 +4,9 @@ from datetime import datetime,timezone,date
 from zoneinfo import ZoneInfo
 from urllib.parse import quote,unquote
 from io import BytesIO
-from openpyxl import load_workbook
+from openpyxl import load_workbook,Workbook
 from fastapi import FastAPI,Request,Form,UploadFile,File,HTTPException
-from fastapi.responses import HTMLResponse,RedirectResponse
+from fastapi.responses import HTMLResponse,RedirectResponse,Response
 
 from db import SessionLocal,User,Setting,Position,Audit,Snapshot,ImportJob,DailyReturnBaseline,DailyReturnPosition,DailyReturnExposureBaseline,DailyReturnExposurePosition,get_setting,set_setting,audit,config_bump,utcnow
 from security import ADMIN_USER,ensure_admin,hash_password,verify_password,sign_session,read_session
@@ -197,7 +197,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.7 — Mobile Menu Icon Fix",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.9 — Combined Fund Exports",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -311,6 +311,12 @@ form[style*="display:flex"]{{align-items:center!important}}form[style*="display:
 @media(max-width:1450px){{.brand-logo img{{width:170px}}.nav-two{{min-width:116px;padding-left:6px;padding-right:6px}}.nav-two span{{font-size:10.7px}}.nav-two strong{{font-size:11.7px}}.top-clock{{padding-left:10px}}.grid{{grid-template-columns:repeat(5,minmax(160px,1fr));overflow-x:auto}}}}
 @media(max-width:1050px){{.topinner{{flex-wrap:wrap;align-items:center;padding-bottom:7px}}.brand-logo{{margin-bottom:0}}nav{{order:3;flex-basis:100%;min-height:58px}}.top-clock{{margin-left:auto;border-left:0}}.admin-layout{{grid-template-columns:1fr}}.admin-side{{position:static;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}}.admin-side-title{{grid-column:1/-1}}.side-group{{border-top:0}}}}
 @media(max-width:760px){{.wrap{{padding:16px 12px 30px}}.brand-logo img{{width:146px}}.top-clock-label{{display:none}}.top-clock-value{{font-size:10.5px}}.nav-two{{min-width:116px}}.grid{{grid-template-columns:1fr;overflow:visible}}.admin-side{{display:block}}h1{{font-size:26px}}}}
+
+.report-export-bar{{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:-8px 0 12px;flex-wrap:wrap}}
+.report-export-bar span{{color:#68758d;font-size:12px;font-weight:600}}
+.export-btn{{display:inline-flex;align-items:center;justify-content:center;padding:7px 12px;border:1px solid #cbd8ea;border-radius:8px;background:#fff;color:#174f91!important;text-decoration:none;font-size:12px;font-weight:700}}
+.export-btn:hover{{background:#eef5ff}}
+@media(max-width:760px){{.report-export-bar{{justify-content:flex-start;margin:0 0 12px}}.export-btn{{min-height:40px;padding:8px 14px}}}}
 .mobile-nav-toggle{{display:none}}
 @media(max-width:760px){{
   html,body{{max-width:100%;overflow-x:hidden}}
@@ -709,6 +715,607 @@ def _merge_market_positions(delta_positions,daily_positions):
     for i,x in enumerate(merged.values(),1):
         x=dict(x);x["id"]=x.get("id") or i;out.append(x)
     return out
+
+def _report_export_links(fund_key,report_key):
+    return (
+        f'<div class="report-export-bar">'
+        f'<span>Export:</span>'
+        f'<a class="export-btn" href="/export/{fund_key}/{report_key}/xlsx">Excel</a>'
+        f'<a class="export-btn" href="/export/{fund_key}/{report_key}/pdf">PDF</a>'
+        f'</div>'
+    )
+
+def _export_position_label(p):
+    inst=str(p.get("instrument_type") or "OPTION").upper()
+    if inst=="OPTION":
+        strike=p.get("strike")
+        st="" if strike is None else f"{float(strike):g}"
+        return f'{str(p.get("ticker") or "").upper()} {p.get("expiry") or ""} {str(p.get("option_type") or "").upper()}{st}'.strip()
+    return str(p.get("ticker") or p.get("security_name") or "").upper()
+
+def _fortress_export_baseline(db):
+    b=_active_daily_baseline(db)
+    if not b:
+        return None,None
+    dbpos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.id).all()
+    positions=[{
+        "id":p.id,
+        "security_name":p.security_name,
+        "instrument_type":p.instrument_type,
+        "ticker":p.ticker,
+        "expiry":p.expiry,
+        "option_type":p.option_type,
+        "strike":p.strike,
+        "quantity":float(p.quantity),
+        "multiplier":float(p.multiplier or 100),
+        "baseline_price":float(p.baseline_price) if p.baseline_price is not None else None,
+        "yahoo_manual_price":float(p.yahoo_manual_price) if p.yahoo_manual_price is not None else None,
+        "bloomberg_manual_price":float(p.bloomberg_manual_price) if p.bloomberg_manual_price is not None else None,
+    } for p in dbpos]
+    baseline={
+        "report_date":b.report_date,
+        "run_date":b.run_date,
+        "filename":b.filename,
+        "nav_usd":float(b.nav_usd),
+    }
+    return baseline,positions
+
+def _collect_delta_export(fund_key):
+    with SessionLocal() as db:
+        if fund_key=="fortress":
+            snap,age=latest_snapshot(db)
+            cfg=int(get_setting(db,"config_version","1"))
+            limit=float(get_setting(db,"limit_pct","15"))
+            if not snap:
+                raise HTTPException(404,"No Fortress Bloomberg Delta snapshot is available.")
+            raw_positions=snap.get("positions",[]) or []
+            positions=sorted(raw_positions,key=lambda x:abs(float(x.get("contribution_pct") or 0)),reverse=True)
+            buffer=snap.get("buffer_pct")
+            title="RPD Fortress Fund - Bloomberg Delta Monitor"
+        else:
+            snap,age=_latest_opportunity_snapshot(db)
+            cfg=int(get_setting(db,"opportunity_config_version","1") or 1)
+            limit=_opp_limit(db)
+            if not snap:
+                raise HTTPException(404,"No Opportunity Bloomberg Delta snapshot is available.")
+            raw_positions=[x for x in (snap.get("positions",[]) or []) if x.get("use_for_delta")]
+            positions=sorted(raw_positions,key=lambda x:abs(float(x.get("contribution_pct") or 0)),reverse=True)
+            buffer=snap.get("buffer_pct")
+            title="RPD Opportunity Fund - Bloomberg Delta Monitor"
+
+    mode=str(snap.get("mode") or "LIVE")
+    closed=(mode=="MARKET_CLOSED")
+    status="MARKET CLOSED" if closed else mode
+    cov=snap.get("coverage",{}) or {}
+    rows=[]
+    for r in positions:
+        rows.append([
+            _export_position_label(r),
+            float(r.get("quantity") or 0),
+            float(r.get("delta_exposure_usd") or 0),
+            float(r.get("contribution_pct") or 0)/100.0,
+        ])
+
+    summary=[
+        ("Feed",status),
+        ("Delta Exposure %",float(snap.get("delta_exposure_pct") or 0)/100.0),
+        ("Delta Exposure $",float(snap.get("delta_exposure_usd") or 0)),
+        ("Limit %",None if limit is None else float(limit)/100.0),
+        ("Buffer %",None if buffer is None else float(buffer)/100.0),
+        ("Coverage",f'{cov.get("valid",0)}/{cov.get("total",0)}'),
+        ("Collector / Portal",f'{snap.get("config_version","-")} / {cfg}'),
+        ("Snapshot (New York)",format_new_york_time(snap.get("timestamp_utc",""))),
+        ("Collector",str(snap.get("collector_id") or "")),
+    ]
+    return {
+        "title":title,
+        "summary":summary,
+        "headers":["Position","Qty","Delta Exposure $","Contribution % NAV"],
+        "rows":rows,
+        "formats":["text","integer","currency0","percent3"],
+        "fund":fund_key,
+        "report_key":"delta",
+    }
+
+def _collect_daily_export(fund_key,source_key):
+    with SessionLocal() as db:
+        if fund_key=="fortress":
+            baseline,positions=_fortress_export_baseline(db)
+            if not baseline:
+                raise HTTPException(404,"No Fortress P&L baseline is available.")
+            if source_key=="bloomberg":
+                snap,_=latest_snapshot(db)
+                calc=_calc_bloomberg_daily(positions,baseline["nav_usd"],snap)
+            else:
+                snap=_latest_yahoo_collector_snapshot(db)
+                calc=calculate_mark_to_market_return(
+                    positions,
+                    baseline["nav_usd"],
+                    quote_data=_yahoo_quote_data_from_snapshot(snap),
+                )
+            fund_name="RPD Fortress Fund"
+        else:
+            baseline=_opportunity_baseline(db)
+            if not baseline:
+                raise HTTPException(404,"No Opportunity P&L baseline is available.")
+            positions=_opp_baseline_positions_for_calc(baseline)
+            if source_key=="bloomberg":
+                snap,_=_latest_opportunity_snapshot(db)
+                calc=_calc_bloomberg_daily(positions,float(baseline.get("nav_usd") or 0),snap)
+            else:
+                snap=_latest_yahoo_v2_fund_snapshot(db,"opportunity")
+                calc=calculate_mark_to_market_return(
+                    positions,
+                    float(baseline.get("nav_usd") or 0),
+                    quote_data=_quote_data_from_snapshot(snap),
+                )
+            fund_name="RPD Opportunity Fund"
+
+    nav=float(baseline.get("nav_usd") or 0)
+    status="FULL" if calc.get("complete") else "PARTIAL"
+    source_name="Bloomberg" if source_key=="bloomberg" else "Yahoo"
+    title=f"{fund_name} - {source_name} Daily Return"
+    snapshot_ts=""
+    if isinstance(snap,dict):
+        snapshot_ts=str(snap.get("timestamp_utc") or snap.get("collected_at_utc") or "")
+
+    summary=[
+        ("Status",status),
+        ("Estimated Daily Return",float(calc.get("estimated_return_pct") or 0)/100.0),
+        ("Estimated P&L",float(calc.get("estimated_pnl") or 0)),
+        ("Baseline NAV",nav),
+        ("Baseline Report Date",str(baseline.get("report_date") or "")),
+        ("Baseline File",str(baseline.get("filename") or "")),
+        ("Coverage",f'{calc.get("coverage_valid",0)}/{calc.get("coverage_total",0)}'),
+        ("Snapshot (New York)",format_new_york_time(snapshot_ts) if snapshot_ts else "-"),
+    ]
+
+    rows=[]
+    for r in calc.get("rows",[]) or []:
+        if source_key=="bloomberg":
+            bid=r.get("bid"); ask=r.get("ask"); market=r.get("market_mark")
+            manual=r.get("bloomberg_manual_price")
+            current=r.get("current_mark")
+            effective_source=r.get("effective_source") or ""
+        else:
+            bid=r.get("bid"); ask=r.get("ask"); market=r.get("market_mark")
+            manual=r.get("manual_price")
+            current=r.get("current_mark")
+            effective_source=r.get("effective_source") or ""
+
+        rows.append([
+            _export_position_label(r),
+            float(r.get("quantity") or 0),
+            r.get("baseline_price",r.get("previous_mark")),
+            bid,
+            ask,
+            market,
+            manual,
+            current,
+            r.get("change"),
+            r.get("estimated_pnl"),
+            None if r.get("contribution_pct") is None else float(r.get("contribution_pct"))/100.0,
+            effective_source,
+        ])
+
+    headers=[
+        "Position","Qty","Previous Mark",
+        f"{source_name} Bid",f"{source_name} Ask",f"{source_name} Market",
+        "Manual Override","Effective Price","Change",
+        "Estimated P&L","Contribution","Effective Source",
+    ]
+    return {
+        "title":title,
+        "summary":summary,
+        "headers":headers,
+        "rows":rows,
+        "formats":["text","integer","price","price","price","price","price","price","price","currency2","percent4","text"],
+        "fund":fund_key,
+        "report_key":f"{source_key}-daily-return",
+    }
+
+def _xlsx_report_bytes(report):
+    wb=Workbook()
+    ws=wb.active
+    ws.title="Report"
+
+    navy="17365D"; blue="D9EAF7"; light="EEF4FB"; white="FFFFFF"; gray="667085"
+    from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
+    thin=Side(style="thin",color="D9E1EA")
+
+    ncols=max(4,len(report["headers"]))
+    ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=ncols)
+    c=ws.cell(1,1,report["title"])
+    c.font=Font(size=16,bold=True,color=navy)
+    c.alignment=Alignment(vertical="center")
+    ws.row_dimensions[1].height=26
+
+    ny_now=datetime.now(ZoneInfo("America/New_York"))
+    ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=ncols)
+    c=ws.cell(2,1,f'Exported: {ny_now.strftime("%Y-%m-%d %I:%M:%S %p")} New York')
+    c.font=Font(size=9,color=gray)
+
+    row=4
+    for label,value in report["summary"]:
+        ws.cell(row,1,label).font=Font(bold=True,color=navy)
+        ws.cell(row,2,value)
+        if label.endswith("%") or label=="Estimated Daily Return":
+            ws.cell(row,2).number_format="0.0000%"
+        elif "$" in label or label in ("Estimated P&L","Baseline NAV"):
+            ws.cell(row,2).number_format='$#,##0.00;[Red]-$#,##0.00'
+        row+=1
+
+    row+=1
+    header_row=row
+    for col,h in enumerate(report["headers"],1):
+        cell=ws.cell(row,col,h)
+        cell.fill=PatternFill("solid",fgColor=navy)
+        cell.font=Font(bold=True,color=white)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=Border(bottom=thin)
+    ws.row_dimensions[row].height=28
+
+    for data in report["rows"]:
+        row+=1
+        for col,val in enumerate(data,1):
+            cell=ws.cell(row,col,val)
+            cell.border=Border(bottom=thin)
+            fmt=report["formats"][col-1]
+            if fmt=="integer": cell.number_format='#,##0;[Red]-#,##0'
+            elif fmt=="currency0": cell.number_format='$#,##0;[Red]-$#,##0'
+            elif fmt=="currency2": cell.number_format='$#,##0.00;[Red]-$#,##0.00'
+            elif fmt=="price": cell.number_format='$0.0000'
+            elif fmt=="percent3": cell.number_format='0.000%'
+            elif fmt=="percent4": cell.number_format='0.0000%'
+        if row%2==0:
+            for col in range(1,ncols+1):
+                ws.cell(row,col).fill=PatternFill("solid",fgColor="F8FAFC")
+
+    widths=[32,12,16,14,14,16,16,16,14,18,16,22]
+    for i in range(1,ncols+1):
+        ws.column_dimensions[chr(64+i) if i<=26 else "A"].width=widths[i-1] if i<=len(widths) else 16
+    # Use get_column_letter for correctness beyond Z.
+    from openpyxl.utils import get_column_letter
+    for i in range(1,ncols+1):
+        ws.column_dimensions[get_column_letter(i)].width=widths[i-1] if i<=len(widths) else 16
+
+    ws.freeze_panes=ws.cell(header_row+1,1)
+    ws.auto_filter.ref=f"A{header_row}:{get_column_letter(ncols)}{row}"
+    ws.sheet_view.showGridLines=False
+    ws.page_setup.orientation="landscape"
+    ws.page_setup.fitToWidth=1
+    ws.sheet_properties.pageSetUpPr.fitToPage=True
+
+    bio=BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+def _pdf_safe_text(value):
+    s="" if value is None else str(value)
+    s=s.replace("—","-").replace("−","-").replace("×","x").replace("÷","/")
+    return s.encode("latin-1","replace").decode("latin-1").replace("\\","\\\\").replace("(","\\(").replace(")","\\)")
+
+def _pdf_fit(value,width,font_size):
+    s="" if value is None else str(value)
+    max_chars=max(3,int(width/(font_size*0.54)))
+    return s if len(s)<=max_chars else s[:max_chars-1]+"~"
+
+def _pdf_report_bytes(report):
+    # Dependency-free landscape Letter PDF using standard Helvetica fonts.
+    page_w,page_h=792.0,612.0
+    margin=24.0
+    font_size=6.7 if len(report["headers"])>6 else 8.5
+
+    if len(report["headers"])<=4:
+        widths=[260,90,170,170]
+    else:
+        widths=[112,48,52,45,45,50,55,52,45,62,52,65]
+
+    total=sum(widths)
+    usable=page_w-2*margin
+    scale=min(1.0,usable/total)
+    widths=[w*scale for w in widths]
+
+    def text_cmd(x,y,text,size=8,bold=False):
+        font="/F2" if bold else "/F1"
+        return f"BT {font} {size:.2f} Tf {x:.2f} {y:.2f} Td ({_pdf_safe_text(text)}) Tj ET\n"
+
+    def line_cmd(x1,y1,x2,y2):
+        return f"0.82 0.86 0.91 RG 0.5 w {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S\n"
+
+    pages=[]
+    rows=list(report["rows"])
+
+    def make_page(page_no,start_index):
+        cmds=[]
+        y=page_h-margin
+        cmds.append(text_cmd(margin,y,report["title"],15,True)); y-=18
+        ny_now=datetime.now(ZoneInfo("America/New_York"))
+        cmds.append(text_cmd(margin,y,f'Exported {ny_now.strftime("%Y-%m-%d %I:%M:%S %p")} New York',7.5,False)); y-=16
+
+        # Summary in two columns.
+        sx=[margin,margin+370]
+        sy=y
+        for i,(label,value) in enumerate(report["summary"]):
+            col=i%2
+            if i and col==0: sy-=13
+            if isinstance(value,float):
+                if label.endswith("%") or label=="Estimated Daily Return":
+                    txt=f"{value*100:.4f}%"
+                elif "$" in label or label in ("Estimated P&L","Baseline NAV"):
+                    txt=f"${value:,.2f}"
+                else:
+                    txt=f"{value:,.4f}"
+            else:
+                txt=str(value)
+            cmds.append(text_cmd(sx[col],sy,f"{label}: {txt}",7.5,False))
+        y=sy-18
+        cmds.append(line_cmd(margin,y,page_w-margin,y)); y-=14
+
+        # Headers
+        x=margin
+        for h,w in zip(report["headers"],widths):
+            cmds.append(text_cmd(x+2,y,_pdf_fit(h,w-4,font_size),font_size,True))
+            x+=w
+        y-=8
+        cmds.append(line_cmd(margin,y,page_w-margin,y)); y-=12
+
+        idx=start_index
+        max_rows=30 if len(report["headers"])>6 else 34
+        count=0
+        while idx<len(rows) and count<max_rows and y>margin+18:
+            data=rows[idx]
+            x=margin
+            for val,w,fmt in zip(data,widths,report["formats"]):
+                if val is None:
+                    txt="-"
+                elif fmt=="integer":
+                    txt=f"{float(val):,.0f}"
+                elif fmt=="currency0":
+                    txt=f"${float(val):,.0f}"
+                elif fmt=="currency2":
+                    txt=f"${float(val):+,.2f}"
+                elif fmt=="price":
+                    txt=f"${float(val):.4f}"
+                elif fmt=="percent3":
+                    txt=f"{float(val)*100:.3f}%"
+                elif fmt=="percent4":
+                    txt=f"{float(val)*100:+.4f}%"
+                else:
+                    txt=str(val)
+                cmds.append(text_cmd(x+2,y,_pdf_fit(txt,w-4,font_size),font_size,False))
+                x+=w
+            y-=14
+            cmds.append(line_cmd(margin,y+3,page_w-margin,y+3))
+            idx+=1; count+=1
+
+        cmds.append(text_cmd(page_w-margin-70,12,f"Page {page_no}",7,False))
+        return "".join(cmds).encode("latin-1","replace"),idx
+
+    next_idx=0; page_no=1
+    while next_idx<len(rows) or page_no==1:
+        content,next_idx=make_page(page_no,next_idx)
+        pages.append(content)
+        page_no+=1
+        if next_idx>=len(rows): break
+
+    # Build PDF objects.
+    objects=[]
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    # Pages object filled after page object ids known.
+    objects.append(b"")
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>")
+
+    page_ids=[]
+    content_ids=[]
+    for content in pages:
+        page_id=len(objects)+1
+        content_id=page_id+1
+        page_ids.append(page_id); content_ids.append(content_id)
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w:.0f} {page_h:.0f}] "
+            f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {content_id} 0 R >>".encode()
+        )
+        objects.append(b"<< /Length "+str(len(content)).encode()+b" >>\nstream\n"+content+b"\nendstream")
+
+    kids=" ".join(f"{pid} 0 R" for pid in page_ids)
+    objects[1]=f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode()
+
+    output=bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets=[0]
+    for i,obj in enumerate(objects,1):
+        offsets.append(len(output))
+        output.extend(f"{i} 0 obj\n".encode())
+        output.extend(obj)
+        output.extend(b"\nendobj\n")
+    xref=len(output)
+    output.extend(f"xref\n0 {len(objects)+1}\n".encode())
+    output.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        output.extend(f"{off:010d} 00000 n \n".encode())
+    output.extend(
+        f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    )
+    return bytes(output)
+
+
+def _fund_reports(fund_key):
+    return [
+        _collect_delta_export(fund_key),
+        _collect_daily_export(fund_key,"bloomberg"),
+        _collect_daily_export(fund_key,"yahoo"),
+    ]
+
+def _xlsx_fund_report_bytes(fund_key):
+    reports=_fund_reports(fund_key)
+    from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
+    from openpyxl.utils import get_column_letter
+
+    wb=Workbook()
+    # remove default; create one sheet per report
+    default=wb.active
+    wb.remove(default)
+
+    sheet_names=[
+        "Bloomberg Delta",
+        "Bloomberg Daily Return",
+        "Yahoo Daily Return",
+    ]
+    navy="17365D"; white="FFFFFF"; gray="667085"
+    thin=Side(style="thin",color="D9E1EA")
+
+    for report,sheet_name in zip(reports,sheet_names):
+        ws=wb.create_sheet(title=sheet_name)
+        ncols=max(4,len(report["headers"]))
+        ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=ncols)
+        c=ws.cell(1,1,report["title"])
+        c.font=Font(size=16,bold=True,color=navy)
+        ws.row_dimensions[1].height=26
+
+        ny_now=datetime.now(ZoneInfo("America/New_York"))
+        ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=ncols)
+        c=ws.cell(2,1,f'Exported: {ny_now.strftime("%Y-%m-%d %I:%M:%S %p")} New York')
+        c.font=Font(size=9,color=gray)
+
+        row=4
+        for label,value in report["summary"]:
+            ws.cell(row,1,label).font=Font(bold=True,color=navy)
+            ws.cell(row,2,value)
+            if label.endswith("%") or label=="Estimated Daily Return":
+                ws.cell(row,2).number_format="0.0000%"
+            elif "$" in label or label in ("Estimated P&L","Baseline NAV"):
+                ws.cell(row,2).number_format='$#,##0.00;[Red]-$#,##0.00'
+            row+=1
+
+        row+=1
+        header_row=row
+        for col,h in enumerate(report["headers"],1):
+            cell=ws.cell(row,col,h)
+            cell.fill=PatternFill("solid",fgColor=navy)
+            cell.font=Font(bold=True,color=white)
+            cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+            cell.border=Border(bottom=thin)
+        ws.row_dimensions[row].height=28
+
+        for data in report["rows"]:
+            row+=1
+            for col,val in enumerate(data,1):
+                cell=ws.cell(row,col,val)
+                cell.border=Border(bottom=thin)
+                fmt=report["formats"][col-1]
+                if fmt=="integer": cell.number_format='#,##0;[Red]-#,##0'
+                elif fmt=="currency0": cell.number_format='$#,##0;[Red]-$#,##0'
+                elif fmt=="currency2": cell.number_format='$#,##0.00;[Red]-$#,##0.00'
+                elif fmt=="price": cell.number_format='$0.0000'
+                elif fmt=="percent3": cell.number_format='0.000%'
+                elif fmt=="percent4": cell.number_format='0.0000%'
+            if row%2==0:
+                for col in range(1,ncols+1):
+                    ws.cell(row,col).fill=PatternFill("solid",fgColor="F8FAFC")
+
+        widths=[32,12,16,14,14,16,16,16,14,18,16,22]
+        for i in range(1,ncols+1):
+            ws.column_dimensions[get_column_letter(i)].width=widths[i-1] if i<=len(widths) else 16
+
+        ws.freeze_panes=ws.cell(header_row+1,1)
+        ws.auto_filter.ref=f"A{header_row}:{get_column_letter(ncols)}{row}"
+        ws.sheet_view.showGridLines=False
+        ws.page_setup.orientation="landscape"
+        ws.page_setup.fitToWidth=1
+        ws.sheet_properties.pageSetUpPr.fitToPage=True
+
+    bio=BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+def _pdf_fund_report_bytes(fund_key):
+    # Reuse the already-tested per-report PDF generator and merge the
+    # three sections into one PDF document.
+    reports=_fund_reports(fund_key)
+    writer=PdfWriter()
+    for report in reports:
+        part=_pdf_report_bytes(report)
+        reader=PdfReader(BytesIO(part))
+        for page in reader.pages:
+            writer.add_page(page)
+    bio=BytesIO()
+    writer.write(bio)
+    return bio.getvalue()
+
+def _fund_export_buttons(fund_key):
+    return (
+        f'<div class="report-export-bar">'
+        f'<span>Export Full Fund Report:</span>'
+        f'<a class="export-btn" href="/export/{fund_key}/xlsx">Excel</a>'
+        f'<a class="export-btn" href="/export/{fund_key}/pdf">PDF</a>'
+        f'</div>'
+    )
+
+@app.get("/export/{fund_key}/{fmt}")
+def export_full_fund_report(request:Request,fund_key:str,fmt:str):
+    require_user(request)
+    fund_key=str(fund_key).lower()
+    fmt=str(fmt).lower()
+    if fund_key not in ("fortress","opportunity"):
+        raise HTTPException(404,"Unknown fund.")
+    if fmt not in ("xlsx","pdf"):
+        raise HTTPException(404,"Unknown export format.")
+
+    date_txt=datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    fund_label="Fortress" if fund_key=="fortress" else "Opportunity"
+    filename=f"RPD_{fund_label}_Full_Report_{date_txt}.{fmt}"
+
+    if fmt=="xlsx":
+        data=_xlsx_fund_report_bytes(fund_key)
+        media="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        data=_pdf_fund_report_bytes(fund_key)
+        media="application/pdf"
+
+    return Response(
+        content=data,
+        media_type=media,
+        headers={"Content-Disposition":f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/export/{fund_key}/{report_key}/{fmt}")
+def export_report(request:Request,fund_key:str,report_key:str,fmt:str):
+    require_user(request)
+    fund_key=str(fund_key).lower()
+    report_key=str(report_key).lower()
+    fmt=str(fmt).lower()
+    if fund_key not in ("fortress","opportunity"):
+        raise HTTPException(404,"Unknown fund.")
+    if fmt not in ("xlsx","pdf"):
+        raise HTTPException(404,"Unknown export format.")
+
+    if report_key=="delta":
+        report=_collect_delta_export(fund_key)
+        report_label="Bloomberg_Delta"
+    elif report_key=="bloomberg-daily-return":
+        report=_collect_daily_export(fund_key,"bloomberg")
+        report_label="Bloomberg_Daily_Return"
+    elif report_key=="yahoo-daily-return":
+        report=_collect_daily_export(fund_key,"yahoo")
+        report_label="Yahoo_Daily_Return"
+    else:
+        raise HTTPException(404,"Unknown report.")
+
+    date_txt=datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    fund_label="Fortress" if fund_key=="fortress" else "Opportunity"
+    filename=f"RPD_{fund_label}_{report_label}_{date_txt}.{fmt}"
+
+    if fmt=="xlsx":
+        data=_xlsx_report_bytes(report)
+        media="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        data=_pdf_report_bytes(report)
+        media="application/pdf"
+    return Response(content=data,media_type=media,headers={"Content-Disposition":f'attachment; filename="{filename}"'})
+
+
 @app.get("/overview")
 def overview(request:Request):
     u=require_user(request)
@@ -790,7 +1397,7 @@ def dashboard(request:Request):
         for r in sorted(p.get("positions",[]),key=lambda x:abs(x.get("contribution_pct",0)),reverse=True):
             rows+=f'<tr><td>{html.escape(r.get("ticker",""))} {html.escape(r.get("expiry",""))} {html.escape(r.get("option_type",""))}{r.get("strike")}</td><td>{r.get("quantity",0):,.0f}</td><td>${r.get("delta_exposure_usd",0):,.0f}</td><td>{r.get("contribution_pct",0):.3f}%</td></tr>'
         mismatch=p.get("config_version")!=cfg
-        body=f"""<h1>RPD Fortress Fund — Bloomberg Delta Monitor</h1><div class="grid">
+        body=f"""<h1>RPD Fortress Fund — Bloomberg Delta Monitor</h1>{_fund_export_buttons("fortress")}<div class="grid">
 <div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed_mode else f'Age {age:.1f}s'}</div></div>
 <div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div>
 <div class="card metric"><div class="muted">Limit</div><div class="v">{limit:.3f}%</div></div>
@@ -815,7 +1422,7 @@ def opportunity_dashboard(request:Request):
             inst=str(r.get("instrument_type") or "OPTION").upper(); label=(f'{r.get("ticker","")} {r.get("expiry","")} {r.get("option_type","")}{r.get("strike")}' if inst=="OPTION" else str(r.get("ticker") or ""))
             rows+=f'<tr><td>{html.escape(label)}</td><td>{float(r.get("quantity") or 0):,.0f}</td><td>${float(r.get("delta_exposure_usd") or 0):,.0f}</td><td>{float(r.get("contribution_pct") or 0):.3f}%</td></tr>'
         limit_html='—' if limit is None else f'{limit:.3f}%';buf_html='—' if buf is None else f'{float(buf):+.3f}%'
-        body=f'''<h1>RPD Opportunity Fund — Bloomberg Delta Monitor</h1><div class="grid"><div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed else f'Age {age:.1f}s'}</div></div><div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div><div class="card metric"><div class="muted">Limit</div><div class="v">{limit_html}</div></div><div class="card metric"><div class="muted">Buffer</div><div class="v">{buf_html}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get('valid',0)}/{cov.get('total',0)}</div><div class="muted">Collector v{p.get('config_version')} / Portal v{cfg}</div></div></div><div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get('timestamp_utc','')))} · Collector: {html.escape(str(p.get('collector_id','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+        body=f'''<h1>RPD Opportunity Fund — Bloomberg Delta Monitor</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed else f'Age {age:.1f}s'}</div></div><div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div><div class="card metric"><div class="muted">Limit</div><div class="v">{limit_html}</div></div><div class="card metric"><div class="muted">Buffer</div><div class="v">{buf_html}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get('valid',0)}/{cov.get('total',0)}</div><div class="muted">Collector v{p.get('config_version')} / Portal v{cfg}</div></div></div><div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get('timestamp_utc','')))} · Collector: {html.escape(str(p.get('collector_id','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>'''
         return page("Opportunity Bloomberg Delta Monitor",body,u,3)
 
 def _render_opportunity_yahoo(request:Request):
@@ -834,7 +1441,7 @@ def _render_opportunity_yahoo(request:Request):
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
         rows+=f'<tr><td>{html.escape(posname)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("previous_mark"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
     warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Yahoo local collector has not supplied a usable current mark for every Opportunity position.</div><br>'
-    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1><div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Opportunity Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/opportunity/yahoo-daily-return")
@@ -857,7 +1464,7 @@ def opportunity_bloomberg_daily_return(request:Request):
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
         rows+=f'<tr><td>{html.escape(name)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("baseline_price"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
     status="FULL" if calc["complete"] else "PARTIAL";warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Bloomberg has not supplied a usable current mark for every Opportunity position.</div><br>'
-    body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1><div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Opportunity Bloomberg Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/admin/opportunity")
@@ -1294,7 +1901,7 @@ def daily_return_page(request:Request):
         warning+='<div class="notice"><strong>Yahoo Collector:</strong> No local collector snapshot has been received yet.</div><br>'
 
     quality_class='ok' if calc['complete'] else 'bad'
-    body=f'''<h1>RPD Fortress Fund — Yahoo Daily Return</h1>
+    body=f'''<h1>RPD Fortress Fund — Yahoo Daily Return</h1>{_fund_export_buttons("fortress")}
 <div class="grid">
 <div class="card metric"><div class="muted">Status</div><div class="v {quality_class}">{status}</div><div class="muted">Mark-to-market estimate</div></div>
 <div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div>
@@ -1457,7 +2064,7 @@ def bloomberg_daily_return_page(request:Request):
     if not complete:
         warning='<div class="notice"><strong>'+status+':</strong> '+feed_note+' The displayed P&amp;L includes covered positions only.</div><br>'
 
-    body=f'''<h1>RPD Fortress Fund — Bloomberg Daily Return</h1>
+    body=f'''<h1>RPD Fortress Fund — Bloomberg Daily Return</h1>{_fund_export_buttons("fortress")}
 <div class="grid">
 <div class="card metric"><div class="muted">Status</div><div class="v {status_class}">{status}</div><div class="muted">Bloomberg marks</div></div>
 <div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div>
