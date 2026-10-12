@@ -13,9 +13,191 @@ from security import ADMIN_USER,ensure_admin,hash_password,verify_password,sign_
 from helpers import option_security,detect_map,parse_upload,parse_nirvana_exposure_rows,normalized_import,keypos
 from daily_return import parse_nirvana_pnl_pdf,calculate_mark_to_market_return,auto_refresh_allowed,ny_time_label
 
+
+PNL_OPTION_RE=re.compile(
+    r"^(?P<ticker>[A-Z0-9.\-]+)\s+(?P<expiry>\d{1,2}/\d{1,2}/\d{2})\s+"
+    r"(?P<strike>[0-9.]+)\s+(?P<type>PUT|CALL)$",
+    re.I,
+)
+
+def _pnl_xlsx_num(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v,(int,float)) and not isinstance(v,bool):
+        try:return float(v)
+        except Exception:return None
+    s=str(v).strip()
+    if not s:return None
+    neg=s.startswith("(") and s.endswith(")")
+    if neg:s=s[1:-1]
+    s=s.replace("$","").replace(",","").replace("%","").strip()
+    try:
+        x=float(s)
+        return -x if neg else x
+    except Exception:
+        return None
+
+def _parse_nirvana_pnl_xlsx(data:bytes,filename:str="PNL.xlsx"):
+    """Parse Nirvana PNL Report exported as XLSX.
+
+    Baseline rules are identical to the existing PDF parser:
+      Previous Mark = Excel Price column exactly
+      Quantity      = Excel Quantity column
+      NAV           = Excel Grand Total Market Value
+
+    This parser does not change current-market Bid/Ask/Last logic.
+    """
+    wb=load_workbook(BytesIO(data),read_only=True,data_only=True)
+
+    required={"security name","price","quantity","market value"}
+    ws=None; vals=None; header_i=None; headers=None
+
+    # Prefer a sheet whose name resembles PNL, but scan every sheet safely.
+    sheets=sorted(
+        wb.worksheets,
+        key=lambda s: (0 if "pnl" in str(s.title or "").lower() else 1)
+    )
+
+    for candidate in sheets:
+        candidate_vals=list(candidate.iter_rows(values_only=True))
+        for i,row in enumerate(candidate_vals[:80]):
+            norm=[str(x or "").strip() for x in (row or [])]
+            lower={x.lower() for x in norm if x}
+            if required.issubset(lower):
+                ws=candidate;vals=candidate_vals;header_i=i;headers=norm
+                break
+        if header_i is not None:
+            break
+
+    if ws is None or vals is None or header_i is None:
+        raise ValueError("Could not locate the PNL table header (Security Name / Price / Quantity / Market Value).")
+
+    hm={h.lower():i for i,h in enumerate(headers) if h}
+
+    # Find Report Date / Run Date from metadata rows above the table.
+    report_date=""
+    run_date=""
+    for row in vals[:header_i]:
+        line=" ".join(str(x or "") for x in row if x not in (None,""))
+        m=re.search(r"Report Date:\s*(\d{1,2}/\d{1,2}/\d{4})",line,re.I)
+        if m and not report_date:
+            report_date=datetime.strptime(m.group(1),"%m/%d/%Y").date().isoformat()
+        m2=re.search(r"Run Date:\s*(.+?)(?:\s{2,}|$)",line,re.I)
+        if m2 and not run_date:
+            run_date=m2.group(1).strip()
+
+    positions=[]
+    ignored=[]
+    nav=None
+
+    for row in vals[header_i+1:]:
+        if not row:
+            continue
+        try:name=str(row[hm["security name"]] or "").strip()
+        except Exception:continue
+        if not name:
+            continue
+
+        upper=name.upper().strip()
+
+        if upper.startswith("GRAND TOTAL"):
+            try: nav=_pnl_xlsx_num(row[hm["market value"]])
+            except Exception: nav=None
+            # Some exports may place Grand Total NAV in another numeric cell.
+            if nav is None:
+                nums=[_pnl_xlsx_num(x) for x in row]
+                nums=[x for x in nums if x is not None]
+                if nums: nav=nums[0]
+            continue
+
+        if upper.startswith("PAGE "):
+            continue
+        if upper in {"CLOSED","FGTXX","MPFXX","USD","CASH"}:
+            continue
+
+        try: price=_pnl_xlsx_num(row[hm["price"]])
+        except Exception: price=None
+        try: qty=_pnl_xlsx_num(row[hm["quantity"]])
+        except Exception: qty=None
+        try: market_value=_pnl_xlsx_num(row[hm["market value"]])
+        except Exception: market_value=None
+
+        if qty is None or price is None:
+            ignored.append(name)
+            continue
+
+        om=PNL_OPTION_RE.match(upper)
+        if om:
+            expiry=datetime.strptime(om.group("expiry"),"%m/%d/%y").date().isoformat()
+            typ="P" if om.group("type").upper()=="PUT" else "C"
+            strike=float(om.group("strike"))
+            positions.append({
+                "security_name":name,
+                "instrument_type":"OPTION",
+                "ticker":om.group("ticker").upper(),
+                "expiry":expiry,
+                "option_type":typ,
+                "strike":strike,
+                "quantity":float(qty),
+                "multiplier":100.0,
+                "baseline_price":float(price),
+                "display_price":float(price),
+                "baseline_market_value":float(market_value if market_value is not None else price*qty*100.0),
+            })
+            continue
+
+        # Same aliases used by the existing PDF parser.
+        if upper.startswith("ISHARES 20+ YEAR TREASURY BOND"):
+            ticker="TLT"
+        elif upper.startswith("ZOOMINFO TECHNOLOGIES INC"):
+            ticker="GTM"
+        elif upper.startswith("POOL CORP"):
+            ticker="POOL"
+        else:
+            ticker=upper.split()[0]
+
+        if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}",ticker):
+            positions.append({
+                "security_name":name,
+                "instrument_type":"EQUITY",
+                "ticker":ticker,
+                "expiry":"",
+                "option_type":"",
+                "strike":None,
+                "quantity":float(qty),
+                "multiplier":1.0,
+                "baseline_price":float(price),
+                "display_price":float(price),
+                "baseline_market_value":float(market_value if market_value is not None else price*qty),
+            })
+        else:
+            ignored.append(name)
+
+    if nav is None or nav<=0:
+        raise ValueError("Could not read Grand Total / NAV from the PNL Excel report.")
+    if not positions:
+        raise ValueError("No live option/equity positions were parsed from the PNL Excel report.")
+
+    return {
+        "report_date":report_date,
+        "run_date":run_date,
+        "nav_usd":float(nav),
+        "positions":positions,
+        "ignored":ignored,
+        "source_format":"XLSX",
+    }
+
+def _parse_pnl_upload(data:bytes,filename:str):
+    lower=str(filename or "").lower()
+    if lower.endswith(".pdf"):
+        return parse_nirvana_pnl_pdf(data)
+    if lower.endswith((".xlsx",".xlsm")):
+        return _parse_nirvana_pnl_xlsx(data,filename)
+    raise ValueError("Unsupported file type. Please upload PDF or XLSX.")
+
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.0 — Logo Display Fix",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.1 — PNL Excel Upload",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -626,7 +808,7 @@ def opportunity_admin(request:Request):
         exp=_opportunity_exposure(db);base=_opportunity_baseline(db);limit=get_setting(db,"opportunity_limit_pct","");ver=get_setting(db,"opportunity_config_version","1")
     exp_txt='<p>No Opportunity Exposure report loaded.</p>' if not exp else f'<div class="notice"><strong>Exposure:</strong> {html.escape(str(exp.get("filename") or ""))} · Report {html.escape(str(exp.get("report_date") or ""))} · NAV ${float(exp.get("nav_usd") or 0):,.2f} · Delta positions {len(exp.get("positions") or [])}</div>'
     base_txt='<p>No Opportunity P&amp;L baseline loaded.</p>' if not base else f'<div class="notice"><strong>P&amp;L baseline:</strong> {html.escape(str(base.get("filename") or ""))} · Report {html.escape(str(base.get("report_date") or ""))} · NAV ${float(base.get("nav_usd") or 0):,.2f} · Daily Return positions {len(base.get("positions") or [])}</div>'
-    body=admin_tabs()+f'''<h1>Opportunity Setup</h1><div class="card"><h3>Opportunity Delta Monitor</h3><p>Upload the latest Nirvana Exposure by Underlying XLSX. This updates only Opportunity.</p><form method="post" action="/admin/opportunity/exposure-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required><button>Upload Opportunity Exposure</button></form><br>{exp_txt}</div><div class="card"><h3>Opportunity Daily Return Baseline</h3><p>Upload the previous trading day's Opportunity PNL Report PDF. It supplies positions, previous marks and NAV for both Bloomberg and Yahoo Daily Return.</p><form method="post" action="/admin/opportunity/pnl-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload Opportunity P&amp;L</button></form><br>{base_txt}</div><div class="card"><h3>Opportunity Settings — Config v{html.escape(str(ver))}</h3><form method="post" action="/admin/opportunity/settings" class="row"><label>Delta Limit % (optional)<input name="limit_pct" value="{html.escape(str(limit or ''))}" placeholder="Leave blank if no limit"></label><button>Publish</button></form></div>'''
+    body=admin_tabs()+f'''<h1>Opportunity Setup</h1><div class="card"><h3>Opportunity Delta Monitor</h3><p>Upload the latest Nirvana Exposure by Underlying XLSX. This updates only Opportunity.</p><form method="post" action="/admin/opportunity/exposure-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required><button>Upload Opportunity Exposure</button></form><br>{exp_txt}</div><div class="card"><h3>Opportunity Daily Return Baseline</h3><p>Upload the previous trading day's Opportunity PNL Report as PDF or Excel (XLSX). It supplies positions, previous marks and NAV for both Bloomberg and Yahoo Daily Return. Excel is recommended when available.</p><form method="post" action="/admin/opportunity/pnl-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Opportunity P&amp;L</button></form><br>{base_txt}</div><div class="card"><h3>Opportunity Settings — Config v{html.escape(str(ver))}</h3><form method="post" action="/admin/opportunity/settings" class="row"><label>Delta Limit % (optional)<input name="limit_pct" value="{html.escape(str(limit or ''))}" placeholder="Leave blank if no limit"></label><button>Publish</button></form></div>'''
     return page("Opportunity Setup",body,u)
 
 @app.post("/admin/opportunity/exposure-upload")
@@ -643,9 +825,10 @@ async def opportunity_exposure_upload(request:Request,file:UploadFile=File(...))
 @app.post("/admin/opportunity/pnl-upload")
 async def opportunity_pnl_upload(request:Request,file:UploadFile=File(...)):
     u=require_admin(request);filename=file.filename or "Opportunity PNL.pdf"
-    if not filename.lower().endswith(".pdf"): raise HTTPException(400,"Please upload the Opportunity PNL Report PDF.")
+    if not filename.lower().endswith((".pdf",".xlsx",".xlsm")): raise HTTPException(400,"Please upload the Opportunity PNL Report as PDF or XLSX.")
     data=await file.read()
-    try: parsed=parse_nirvana_pnl_pdf(data)
+    if len(data)>12*1024*1024: raise HTTPException(400,"PNL report file is too large.")
+    try: parsed=_parse_pnl_upload(data,filename)
     except Exception as e: raise HTTPException(400,f"Could not parse Opportunity PNL Report: {e}")
     positions=[]
     for i,x in enumerate(parsed["positions"],1):
@@ -1254,8 +1437,8 @@ def daily_return_admin(request:Request):
 
     body=admin_tabs()+f'''
 <div class="card"><h2>Daily Return — P&amp;L Baseline</h2>
-<p>Upload the previous trading day's Nirvana <strong>PNL Report PDF</strong>. That single PDF supplies positions, quantities, previous marks and NAV and is shared by both Bloomberg Daily Return and Yahoo Daily Return.</p>
-<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,application/pdf" required><button>Upload P&amp;L Baseline</button></form><br>{current}</div>
+<p>Upload the previous trading day's Nirvana <strong>PNL Report</strong> as PDF or Excel (XLSX). The file supplies positions, quantities, previous marks and NAV and is shared by both Bloomberg Daily Return and Yahoo Daily Return. Excel is recommended when available.</p>
+<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload P&amp;L Baseline</button></form><br>{current}</div>
 <div class="card"><h3>Calculation</h3>
 <p><strong>Current Mark = (Yahoo Bid + Yahoo Ask) ÷ 2 when both are available; otherwise Yahoo Last.</strong></p>
 <p><strong>Position P&amp;L = (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier</strong></p>
@@ -1308,13 +1491,13 @@ async def daily_return_manual_price(request:Request):
 async def daily_return_upload(request:Request,file:UploadFile=File(...)):
     u=require_admin(request)
     filename=file.filename or "PNL.pdf"
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(400,"Please upload the Nirvana PNL Report as PDF.")
+    if not filename.lower().endswith((".pdf",".xlsx",".xlsm")):
+        raise HTTPException(400,"Please upload the Nirvana PNL Report as PDF or XLSX.")
     data=await file.read()
-    if len(data)>8*1024*1024:
-        raise HTTPException(400,"PDF is too large.")
+    if len(data)>12*1024*1024:
+        raise HTTPException(400,"PNL report file is too large.")
     try:
-        parsed=parse_nirvana_pnl_pdf(data)
+        parsed=_parse_pnl_upload(data,filename)
     except Exception as e:
         raise HTTPException(400,f"Could not parse PNL Report: {e}")
 
