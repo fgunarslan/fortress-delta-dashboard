@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote,unquote
 from io import BytesIO
 from openpyxl import load_workbook,Workbook
+from pypdf import PdfReader,PdfWriter
 from fastapi import FastAPI,Request,Form,UploadFile,File,HTTPException
 from fastapi.responses import HTMLResponse,RedirectResponse,Response
 
@@ -197,7 +198,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.9 — Combined Fund Exports",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.10 — PDF Export Fix",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
