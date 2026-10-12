@@ -197,7 +197,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.6 — Mobile Responsive",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.7 — Mobile Menu Icon Fix",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -321,9 +321,9 @@ form[style*="display:flex"]{{align-items:center!important}}form[style*="display:
   .top-clock-icon{{font-size:17px}}
   .top-clock-label{{display:block;font-size:9.5px}}
   .top-clock-value{{font-size:10px;white-space:normal;line-height:1.2;text-align:left}}
-  .mobile-nav-toggle{{grid-column:1/-1;grid-row:2;display:flex;width:100%;height:44px;border:0;border-top:1px solid rgba(255,255,255,.15);background:transparent;color:#fff;align-items:center;justify-content:flex-start;gap:5px;padding:10px 8px;cursor:pointer}}
-  .mobile-nav-toggle span{{display:block;width:24px;height:2px;background:#fff;border-radius:2px}}
-  .mobile-nav-toggle::after{{content:"Menu";font-weight:700;font-size:14px;margin-left:10px}}
+  .mobile-nav-toggle{{grid-column:1/-1;grid-row:2;display:grid;grid-template-columns:28px auto;grid-template-rows:repeat(3,4px);column-gap:12px;row-gap:3px;width:100%;height:52px;border:0;border-top:1px solid rgba(255,255,255,.15);background:transparent;color:#fff;align-content:center;justify-content:start;padding:10px 12px;cursor:pointer}}
+  .mobile-nav-toggle span{{display:block;width:28px;height:3px;background:#fff;border-radius:2px;grid-column:1}}
+  .mobile-nav-toggle::after{{content:"Menu";font-weight:700;font-size:14px;grid-column:2;grid-row:1/4;align-self:center;margin-left:0}}.mobile-nav-toggle span:nth-child(1){{grid-row:1}}.mobile-nav-toggle span:nth-child(2){{grid-row:2}}.mobile-nav-toggle span:nth-child(3){{grid-row:3}}
   nav#primary-nav{{grid-column:1/-1;grid-row:3;display:none;flex-direction:column;overflow:visible;width:100%;gap:2px;padding-top:4px}}
   nav#primary-nav.mobile-open{{display:flex}}
   nav#primary-nav a,.nav-user{{width:100%;min-width:0!important;min-height:44px;border-bottom:1px solid rgba(255,255,255,.08);border-left:3px solid transparent;padding:9px 12px!important;justify-content:center}}
