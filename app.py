@@ -197,7 +197,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.2 — Visual Refresh",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.3 — Overview Menu Return",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -239,7 +239,8 @@ def page(title,body,user=None,refresh=None):
     def nav_class(key):
         t=str(title or "").lower()
         active=False
-        if key=="fortress_bloomberg": active=(t=="delta monitor")
+        if key=="overview": active=(t=="overview")
+        elif key=="fortress_bloomberg": active=(t=="delta monitor")
         elif key=="fortress_daily": active=(t=="bloomberg daily return")
         elif key=="fortress_yahoo": active=(t in {"yahoo daily return","estimated daily return"})
         elif key=="opp_bloomberg": active=(t=="opportunity bloomberg delta monitor")
@@ -255,6 +256,7 @@ def page(title,body,user=None,refresh=None):
         adminlink=(f'<a href="/admin" class="nav-short {nav_class("admin")}"><span class="nav-single">Admin</span></a>' if user["username"]==ADMIN_USER else "")
         display_user=html.escape(str(user["username"]).capitalize())
         auth=(
+            f'<a href="/overview" class="nav-short {nav_class("overview")}"><span class="nav-single">Overview</span></a>'
             f'<a href="/opportunity" class="nav-two {nav_class("opp_bloomberg")}"><span>Opportunity Bloomberg</span><strong>Delta</strong></a>'
             f'<a href="/opportunity/bloomberg-daily-return" class="nav-two {nav_class("opp_daily")}"><span>Opportunity Bloomberg</span><strong>Daily Return</strong></a>'
             f'<a href="/opportunity/yahoo-daily-return" class="nav-two {nav_class("opp_yahoo")}"><span>Opportunity Yahoo</span><strong>Daily Return</strong></a>'
