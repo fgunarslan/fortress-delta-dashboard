@@ -197,7 +197,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.4 — Clock Alignment",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.5 — Nav & Clock Alignment",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -256,7 +256,7 @@ def page(title,body,user=None,refresh=None):
         adminlink=(f'<a href="/admin" class="nav-short {nav_class("admin")}"><span class="nav-single">Admin</span></a>' if user["username"]==ADMIN_USER else "")
         display_user=html.escape(str(user["username"]).capitalize())
         auth=(
-            f'<a href="/overview" class="nav-short {nav_class("overview")}"><span class="nav-single">Overview</span></a>'
+            f'<a href="/overview" class="nav-two nav-overview {nav_class("overview")}"><span>Overview</span><strong aria-hidden="true">&nbsp;</strong></a>'
             f'<a href="/opportunity" class="nav-two {nav_class("opp_bloomberg")}"><span>Opportunity Bloomberg</span><strong>Delta</strong></a>'
             f'<a href="/opportunity/bloomberg-daily-return" class="nav-two {nav_class("opp_daily")}"><span>Opportunity Bloomberg</span><strong>Daily Return</strong></a>'
             f'<a href="/opportunity/yahoo-daily-return" class="nav-two {nav_class("opp_yahoo")}"><span>Opportunity Yahoo</span><strong>Daily Return</strong></a>'
@@ -299,8 +299,8 @@ def page(title,body,user=None,refresh=None):
 nav{{display:flex;align-items:stretch;gap:2px;min-width:0;flex:1;overflow-x:auto;scrollbar-width:thin;scrollbar-color:#7f91aa transparent}}nav::-webkit-scrollbar{{height:4px}}nav::-webkit-scrollbar-thumb{{background:#71849f;border-radius:9px}}
 nav a{{color:#fff;text-decoration:none;border-bottom:3px solid transparent;transition:background .15s ease,border-color .15s ease,color .15s ease}}nav a:hover{{background:rgba(255,255,255,.075)}}nav a.active{{background:#1d4574;border-bottom-color:#9fc5f5}}
 .nav-two{{min-width:126px;padding:13px 8px 10px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;white-space:nowrap;line-height:1.08}}.nav-two span{{font-size:11.5px;font-weight:500}}.nav-two strong{{font-size:12.5px;margin-top:5px;font-weight:700}}
-.nav-short{{min-width:61px;padding:0 10px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;white-space:nowrap}}.nav-single{{display:block}}.nav-user{{min-width:52px;padding:0 9px;display:flex;align-items:center;justify-content:center;font-size:12px;color:#dce7f5;white-space:nowrap}}
-.top-clock{{display:flex;align-items:center;gap:9px;border-left:1px solid rgba(255,255,255,.22);padding-left:14px;margin:9px 10px 9px 4px;white-space:nowrap;flex:0 0 auto}}.top-clock-icon{{font-size:19px;line-height:1}}.top-clock-text{{display:flex;flex-direction:column;line-height:1.15}}.top-clock-label{{font-size:10.5px;color:#b9c8dc;font-weight:600}}.top-clock-value{{font-size:11.5px;color:#fff;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}}
+.nav-short{{min-width:61px;padding:0 10px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;white-space:nowrap}}.nav-overview{{min-width:84px;padding-left:12px;padding-right:12px}}.nav-single{{display:block}}.nav-user{{min-width:52px;padding:0 9px;display:flex;align-items:center;justify-content:center;font-size:12px;color:#dce7f5;white-space:nowrap}}
+.top-clock{{display:flex;align-items:center;gap:9px;border-left:1px solid rgba(255,255,255,.22);padding-left:14px;margin:9px 34px 9px 4px;white-space:nowrap;flex:0 0 auto}}.top-clock-icon{{font-size:19px;line-height:1}}.top-clock-text{{display:flex;flex-direction:column;line-height:1.15}}.top-clock-label{{font-size:10.5px;color:#b9c8dc;font-weight:600}}.top-clock-value{{font-size:11.5px;color:#fff;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}}
 .card{{background:#fff;border:1px solid #dce4ef;border-radius:13px;padding:16px 18px;margin-bottom:14px;box-shadow:0 1px 2px rgba(15,39,70,.025)}}.grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:16px}}.grid>.card{{margin-bottom:0;min-height:115px}}
 .metric{{position:relative;overflow:hidden}}.metric:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:#d6e4f8}}.grid>.metric:nth-child(1){{background:linear-gradient(135deg,#f6fffb,#fff)}}.grid>.metric:nth-child(1):before{{background:#2aa66a}}.grid>.metric:nth-child(2){{background:linear-gradient(135deg,#fbf9ff,#fff)}}.grid>.metric:nth-child(2):before{{background:#7457d9}}.grid>.metric:nth-child(3){{background:linear-gradient(135deg,#fffafa,#fff)}}.grid>.metric:nth-child(3):before{{background:#e15f55}}.grid>.metric:nth-child(4){{background:linear-gradient(135deg,#f8fbff,#fff)}}.grid>.metric:nth-child(4):before{{background:#498ee7}}.grid>.metric:nth-child(5){{background:linear-gradient(135deg,#fffcf6,#fff)}}.grid>.metric:nth-child(5):before{{background:#e3a126}}
 .metric .v{{font-size:25px;font-weight:750;margin-top:7px;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.muted{{color:#718099;font-size:12.5px;line-height:1.35}}.ok{{color:#087a4b}}.bad{{color:#c22a20}}.notice{{padding:11px 13px;background:#fff8e8;border:1px solid #f4d790;border-radius:9px;color:#684c00}}
