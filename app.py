@@ -50,7 +50,7 @@ def _parse_nirvana_pnl_xlsx(data:bytes,filename:str="PNL.xlsx"):
     """
     wb=load_workbook(BytesIO(data),read_only=True,data_only=True)
 
-    required={"security name","price","quantity","market value"}
+    required={"security name","price","market value"}
     ws=None; vals=None; header_i=None; headers=None
 
     # Prefer a sheet whose name resembles PNL, but scan every sheet safely.
@@ -71,7 +71,7 @@ def _parse_nirvana_pnl_xlsx(data:bytes,filename:str="PNL.xlsx"):
             break
 
     if ws is None or vals is None or header_i is None:
-        raise ValueError("Could not locate the PNL table header (Security Name / Price / Quantity / Market Value).")
+        raise ValueError("Could not locate the PNL table header (Security Name / Price / Market Value).")
 
     hm={h.lower():i for i,h in enumerate(headers) if h}
 
@@ -118,17 +118,25 @@ def _parse_nirvana_pnl_xlsx(data:bytes,filename:str="PNL.xlsx"):
 
         try: price=_pnl_xlsx_num(row[hm["price"]])
         except Exception: price=None
-        try: qty=_pnl_xlsx_num(row[hm["quantity"]])
+        try: qty=_pnl_xlsx_num(row[hm["quantity"]]) if "quantity" in hm else None
         except Exception: qty=None
         try: market_value=_pnl_xlsx_num(row[hm["market value"]])
         except Exception: market_value=None
 
-        if qty is None or price is None:
+        if price is None:
             ignored.append(name)
             continue
 
         om=PNL_OPTION_RE.match(upper)
         if om:
+            # Some Nirvana PNL Excel exports omit the Quantity column entirely.
+            # For options, Market Value = Price × Quantity × 100, so recover the
+            # exact quantity when Quantity is absent.
+            if qty is None and market_value is not None and price != 0:
+                qty=market_value/(price*100.0)
+            if qty is None:
+                ignored.append(name)
+                continue
             expiry=datetime.strptime(om.group("expiry"),"%m/%d/%y").date().isoformat()
             typ="P" if om.group("type").upper()=="PUT" else "C"
             strike=float(om.group("strike"))
@@ -158,6 +166,12 @@ def _parse_nirvana_pnl_xlsx(data:bytes,filename:str="PNL.xlsx"):
             ticker=upper.split()[0]
 
         if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}",ticker):
+            # Equity Market Value = Price × Quantity.
+            if qty is None and market_value is not None and price != 0:
+                qty=market_value/price
+            if qty is None:
+                ignored.append(name)
+                continue
             positions.append({
                 "security_name":name,
                 "instrument_type":"EQUITY",
@@ -198,7 +212,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.10 — PDF Export Fix",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.12 — Delta Input Transparency",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -793,6 +807,9 @@ def _collect_delta_export(fund_key):
         rows.append([
             _export_position_label(r),
             float(r.get("quantity") or 0),
+            r.get("delta"),
+            r.get("underlying_spot"),
+            r.get("multiplier"),
             float(r.get("delta_exposure_usd") or 0),
             float(r.get("contribution_pct") or 0)/100.0,
         ])
@@ -811,9 +828,9 @@ def _collect_delta_export(fund_key):
     return {
         "title":title,
         "summary":summary,
-        "headers":["Position","Qty","Delta Exposure $","Contribution % NAV"],
+        "headers":["Position","Qty","Bloomberg Delta","Underlying Price","Multiplier","Delta Exposure $","Contribution % NAV"],
         "rows":rows,
-        "formats":["text","integer","currency0","percent3"],
+        "formats":["text","integer","raw4","price","integer","currency0","percent3"],
         "fund":fund_key,
         "report_key":"delta",
     }
@@ -966,6 +983,7 @@ def _xlsx_report_bytes(report):
             elif fmt=="currency0": cell.number_format='$#,##0;[Red]-$#,##0'
             elif fmt=="currency2": cell.number_format='$#,##0.00;[Red]-$#,##0.00'
             elif fmt=="price": cell.number_format='$0.0000'
+            elif fmt=="raw4": cell.number_format='0.0000'
             elif fmt=="percent3": cell.number_format='0.000%'
             elif fmt=="percent4": cell.number_format='0.0000%'
         if row%2==0:
@@ -1007,7 +1025,9 @@ def _pdf_report_bytes(report):
     margin=24.0
     font_size=6.7 if len(report["headers"])>6 else 8.5
 
-    if len(report["headers"])<=4:
+    if len(report["headers"])==7:
+        widths=[175,70,90,105,72,120,110]
+    elif len(report["headers"])<=4:
         widths=[260,90,170,170]
     else:
         widths=[112,48,52,45,45,50,55,52,45,62,52,65]
@@ -1078,6 +1098,8 @@ def _pdf_report_bytes(report):
                     txt=f"${float(val):+,.2f}"
                 elif fmt=="price":
                     txt=f"${float(val):.4f}"
+                elif fmt=="raw4":
+                    txt=f"{float(val):+.4f}"
                 elif fmt=="percent3":
                     txt=f"{float(val)*100:.3f}%"
                 elif fmt=="percent4":
@@ -1381,6 +1403,27 @@ def overview(request:Request):
 
     return page("Overview",body,u,60)
 
+
+def _delta_input_cell(value,source,kind="number"):
+    if value is None:
+        main="—"
+    else:
+        try:
+            v=float(value)
+            if kind=="price":
+                main=f"${v:,.2f}"
+            elif kind=="delta":
+                main=f"{v:+.4f}"
+            elif kind=="multiplier":
+                main=f"{v:,.0f}"
+            else:
+                main=f"{v:,.4f}"
+        except Exception:
+            main=html.escape(str(value))
+    src=html.escape(str(source or ""))
+    sub=f'<div class="muted" style="font-size:10px;margin-top:2px">{src}</div>' if src else ""
+    return f'<div>{main}</div>{sub}'
+
 @app.get("/")
 def dashboard(request:Request):
     u=current_user(request)
@@ -1396,7 +1439,7 @@ def dashboard(request:Request):
         pct=p.get("delta_exposure_pct",0) or 0;buf=p.get("buffer_pct",0) or 0;exp=p.get("delta_exposure_usd",0) or 0;cov=p.get("coverage",{})
         rows=""
         for r in sorted(p.get("positions",[]),key=lambda x:abs(x.get("contribution_pct",0)),reverse=True):
-            rows+=f'<tr><td>{html.escape(r.get("ticker",""))} {html.escape(r.get("expiry",""))} {html.escape(r.get("option_type",""))}{r.get("strike")}</td><td>{r.get("quantity",0):,.0f}</td><td>${r.get("delta_exposure_usd",0):,.0f}</td><td>{r.get("contribution_pct",0):.3f}%</td></tr>'
+            rows+=f'<tr><td>{html.escape(r.get("ticker",""))} {html.escape(r.get("expiry",""))} {html.escape(r.get("option_type",""))}{r.get("strike")}</td><td>{r.get("quantity",0):,.0f}</td><td>{_delta_input_cell(r.get("delta"),r.get("delta_source"),"delta")}</td><td>{_delta_input_cell(r.get("underlying_spot"),r.get("spot_source"),"price")}</td><td>{_delta_input_cell(r.get("multiplier"),None,"multiplier")}</td><td>${r.get("delta_exposure_usd",0):,.0f}</td><td>{r.get("contribution_pct",0):.3f}%</td></tr>'
         mismatch=p.get("config_version")!=cfg
         body=f"""<h1>RPD Fortress Fund — Bloomberg Delta Monitor</h1>{_fund_export_buttons("fortress")}<div class="grid">
 <div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed_mode else f'Age {age:.1f}s'}</div></div>
@@ -1406,7 +1449,7 @@ def dashboard(request:Request):
 <div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get("valid",0)}/{cov.get("total",0)}</div><div class="muted">Collector v{p.get("config_version")} / Portal v{cfg}</div></div></div>
 {('<div class="notice">A new portfolio config is published; collector has not reported it yet.</div>' if mismatch else '')}
 <div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get("timestamp_utc","")))} · Collector: {html.escape(p.get("collector_id",""))}</div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>"""
+<div class="card"><div class="muted" style="margin-bottom:10px"><strong>Formula:</strong> Qty × Multiplier × Bloomberg Delta × Underlying Price = Delta Exposure $</div><table><thead><tr><th>Position</th><th>Qty</th><th>Bloomberg Delta</th><th>Underlying Price</th><th>Multiplier</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>"""
         return page("Delta Monitor",body,u,3)
 
 
@@ -1421,9 +1464,9 @@ def opportunity_dashboard(request:Request):
         pct=float(p.get("delta_exposure_pct",0) or 0);exp=float(p.get("delta_exposure_usd",0) or 0);buf=p.get("buffer_pct");cov=p.get("coverage",{}) or {};rows=""
         for r in sorted([x for x in (p.get("positions",[]) or []) if x.get("use_for_delta")],key=lambda x:abs(float(x.get("contribution_pct") or 0)),reverse=True):
             inst=str(r.get("instrument_type") or "OPTION").upper(); label=(f'{r.get("ticker","")} {r.get("expiry","")} {r.get("option_type","")}{r.get("strike")}' if inst=="OPTION" else str(r.get("ticker") or ""))
-            rows+=f'<tr><td>{html.escape(label)}</td><td>{float(r.get("quantity") or 0):,.0f}</td><td>${float(r.get("delta_exposure_usd") or 0):,.0f}</td><td>{float(r.get("contribution_pct") or 0):.3f}%</td></tr>'
+            rows+=f'<tr><td>{html.escape(label)}</td><td>{float(r.get("quantity") or 0):,.0f}</td><td>{_delta_input_cell(r.get("delta"),r.get("delta_source"),"delta")}</td><td>{_delta_input_cell(r.get("underlying_spot"),r.get("spot_source"),"price")}</td><td>{_delta_input_cell(r.get("multiplier"),None,"multiplier")}</td><td>${float(r.get("delta_exposure_usd") or 0):,.0f}</td><td>{float(r.get("contribution_pct") or 0):.3f}%</td></tr>'
         limit_html='—' if limit is None else f'{limit:.3f}%';buf_html='—' if buf is None else f'{float(buf):+.3f}%'
-        body=f'''<h1>RPD Opportunity Fund — Bloomberg Delta Monitor</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed else f'Age {age:.1f}s'}</div></div><div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div><div class="card metric"><div class="muted">Limit</div><div class="v">{limit_html}</div></div><div class="card metric"><div class="muted">Buffer</div><div class="v">{buf_html}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get('valid',0)}/{cov.get('total',0)}</div><div class="muted">Collector v{p.get('config_version')} / Portal v{cfg}</div></div></div><div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get('timestamp_utc','')))} · Collector: {html.escape(str(p.get('collector_id','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+        body=f'''<h1>RPD Opportunity Fund — Bloomberg Delta Monitor</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Feed</div><div class="v {'bad' if stale else 'ok'}">{status}</div><div class="muted">{'Final closing snapshot' if closed else f'Age {age:.1f}s'}</div></div><div class="card metric"><div class="muted">Delta Exposure</div><div class="v">{pct:.3f}%</div><div class="muted">${exp:,.0f}</div></div><div class="card metric"><div class="muted">Limit</div><div class="v">{limit_html}</div></div><div class="card metric"><div class="muted">Buffer</div><div class="v">{buf_html}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{cov.get('valid',0)}/{cov.get('total',0)}</div><div class="muted">Collector v{p.get('config_version')} / Portal v{cfg}</div></div></div><div class="card"><div class="muted">Last update (New York)</div>{html.escape(format_new_york_time(p.get('timestamp_utc','')))} · Collector: {html.escape(str(p.get('collector_id','')))}</div><div class="card"><div class="muted" style="margin-bottom:10px"><strong>Formula:</strong> Qty × Multiplier × Bloomberg Delta × Underlying Price = Delta Exposure $</div><table><thead><tr><th>Position</th><th>Qty</th><th>Bloomberg Delta</th><th>Underlying Price</th><th>Multiplier</th><th>Delta Exposure $</th><th>Contribution % NAV</th></tr></thead><tbody>{rows}</tbody></table></div>'''
         return page("Opportunity Bloomberg Delta Monitor",body,u,3)
 
 def _render_opportunity_yahoo(request:Request):
