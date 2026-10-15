@@ -212,7 +212,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.12 — Delta Input Transparency",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.13 — Opportunity Portfolio History",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -457,6 +457,192 @@ def _opportunity_baseline(db):
 def _opportunity_exposure(db):
     x=_json_setting(db,"opportunity_exposure_config",None)
     return x if isinstance(x,dict) else None
+
+def _opp_position_identity(p):
+    """Stable instrument identity for Opportunity history/change tracking."""
+    inst=str(p.get("instrument_type") or "OPTION").upper()
+    ticker=str(p.get("ticker") or "").upper().strip()
+    if inst=="OPTION":
+        expiry=str(p.get("expiry") or "")
+        typ=str(p.get("option_type") or "").upper()[:1]
+        try: strike=round(float(p.get("strike")),6)
+        except Exception: strike=0.0
+        return f"OPTION|{ticker}|{expiry}|{typ}|{strike:g}"
+    return f"EQUITY|{ticker}"
+
+
+def _opp_position_label(p):
+    inst=str(p.get("instrument_type") or "OPTION").upper()
+    ticker=str(p.get("ticker") or "").upper().strip()
+    if inst=="OPTION":
+        try: strike=f"{float(p.get('strike')):g}"
+        except Exception: strike=str(p.get("strike") or "")
+        return f"{ticker} {p.get('expiry') or ''} {str(p.get('option_type') or '').upper()[:1]}{strike}".strip()
+    return ticker
+
+
+def _opp_report_day(report_date=""):
+    s=str(report_date or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}",s):
+        return s
+    return date.today().isoformat()
+
+
+def _opp_is_expired(p,as_of=None):
+    expiry=str(p.get("expiry") or "").strip()
+    if not expiry:
+        return False
+    day=str(as_of or date.today().isoformat())
+    return expiry < day
+
+
+def _opp_status(p,as_of=None):
+    if _opp_is_expired(p,as_of):
+        return "EXPIRED"
+    return "ACTIVE" if bool(p.get("active",True)) else "ARCHIVED"
+
+
+def _opp_exposure_history(db,exp=None):
+    hist=_json_setting(db,"opportunity_exposure_portfolio_history",None)
+    if isinstance(hist,dict) and isinstance(hist.get("positions"),list):
+        return hist
+    exp=exp if isinstance(exp,dict) else _opportunity_exposure(db)
+    positions=[]
+    for p in list((exp or {}).get("positions") or []):
+        x=dict(p);x["active"]=True
+        x["first_seen"]=(exp or {}).get("report_date") or ""
+        x["last_seen"]=(exp or {}).get("report_date") or ""
+        x["exit_status"]=""
+        positions.append(x)
+    return {"positions":positions,"report_date":(exp or {}).get("report_date") or "","filename":(exp or {}).get("filename") or ""}
+
+
+def _opp_compare_positions(old_positions,new_positions,as_of):
+    old_map={_opp_position_identity(p):dict(p) for p in (old_positions or [])}
+    new_map={_opp_position_identity(p):dict(p) for p in (new_positions or [])}
+    added=[];archived=[];expired=[];qty_changed=[];reactivated=[]
+    for k,n in new_map.items():
+        o=old_map.get(k)
+        if o is None:
+            added.append({"position":_opp_position_label(n),"quantity":n.get("quantity")})
+            continue
+        try: oq=float(o.get("quantity") or 0);nq=float(n.get("quantity") or 0)
+        except Exception: oq=o.get("quantity");nq=n.get("quantity")
+        if oq!=nq:
+            qty_changed.append({"position":_opp_position_label(n),"old":oq,"new":nq})
+        if o.get("active") is False:
+            reactivated.append({"position":_opp_position_label(n),"quantity":n.get("quantity")})
+    for k,o in old_map.items():
+        if k not in new_map and o.get("active",True):
+            item={"position":_opp_position_label(o),"quantity":o.get("quantity")}
+            if _opp_is_expired(o,as_of): expired.append(item)
+            else: archived.append(item)
+    return {"added":added,"archived":archived,"expired":expired,"quantity_changed":qty_changed,"reactivated":reactivated}
+
+
+def _opp_update_exposure_history(db,parsed,filename):
+    previous_exp=_opportunity_exposure(db)
+    hist=_opp_exposure_history(db,previous_exp)
+    old_positions=list(hist.get("positions") or [])
+    as_of=_opp_report_day(parsed.get("report_date"))
+    changes=_opp_compare_positions(old_positions,parsed.get("positions") or [],as_of)
+    registry={_opp_position_identity(p):dict(p) for p in old_positions}
+    incoming={_opp_position_identity(p):dict(p) for p in (parsed.get("positions") or [])}
+    for key,p in incoming.items():
+        old=registry.get(key,{})
+        x=dict(old);x.update(p)
+        x["active"]=True
+        x["first_seen"]=old.get("first_seen") or parsed.get("report_date") or as_of
+        x["last_seen"]=parsed.get("report_date") or as_of
+        x["archived_at"]="";x["exit_status"]=""
+        registry[key]=x
+    for key,old in list(registry.items()):
+        if key in incoming: continue
+        if old.get("active",True):
+            old["active"]=False
+            old["archived_at"]=parsed.get("report_date") or as_of
+            old["exit_status"]="EXPIRED" if _opp_is_expired(old,as_of) else "ARCHIVED"
+            registry[key]=old
+    out={"filename":filename,"report_date":parsed.get("report_date") or "","updated_at":utcnow().isoformat(),"positions":list(registry.values())}
+    _set_json_setting(db,"opportunity_exposure_portfolio_history",out)
+    change_record={"filename":filename,"report_date":parsed.get("report_date") or "","created_at":utcnow().isoformat(),**changes}
+    _set_json_setting(db,"opportunity_exposure_last_changes",change_record)
+    return changes
+
+
+def _opp_pnl_changes(db,parsed,filename):
+    previous=_opportunity_baseline(db)
+    old=[]
+    for p in list((previous or {}).get("positions") or []):
+        x=dict(p);x["active"]=True;old.append(x)
+    new=list(parsed.get("positions") or [])
+    as_of=_opp_report_day(parsed.get("report_date"))
+    changes=_opp_compare_positions(old,new,as_of)
+    rec={"filename":filename,"report_date":parsed.get("report_date") or "","created_at":utcnow().isoformat(),**changes}
+    _set_json_setting(db,"opportunity_pnl_last_changes",rec)
+    return changes
+
+
+def _opp_changes_html(changes,title):
+    if not isinstance(changes,dict):
+        return f'<div class="notice"><strong>{html.escape(title)}:</strong> Tracking is ready. Changes will appear after the next upload.</div>'
+    groups=[("Added","added"),("Reactivated","reactivated"),("Archived / Removed","archived"),("Expired","expired"),("Quantity Changed","quantity_changed")]
+    total=sum(len(changes.get(k) or []) for _,k in groups)
+    head=f'<div class="notice"><strong>{html.escape(title)}</strong> · {html.escape(str(changes.get("filename") or ""))} · Report {html.escape(str(changes.get("report_date") or ""))}'
+    if total==0:
+        return head+'<br><span class="ok"><strong>No position changes detected.</strong></span></div>'
+    parts=[head+'<br>']
+    for label,key in groups:
+        items=changes.get(key) or []
+        if not items: continue
+        parts.append(f'<div style="margin-top:8px"><strong>{html.escape(label)} — {len(items)}</strong><ul style="margin:5px 0 0 20px">')
+        for item in items:
+            pos=html.escape(str(item.get("position") or ""))
+            if key=="quantity_changed":
+                try: detail=f'{float(item.get("old")):,.0f} → {float(item.get("new")):,.0f}'
+                except Exception: detail=f'{item.get("old")} → {item.get("new")}'
+                parts.append(f'<li>{pos}: {html.escape(detail)}</li>')
+            else:
+                parts.append(f'<li>{pos}</li>')
+        parts.append('</ul></div>')
+    parts.append('</div>')
+    return ''.join(parts)
+
+
+def _opp_portfolio_table(hist):
+    rows=[];today=date.today().isoformat()
+    positions=list((hist or {}).get("positions") or [])
+    def sk(p):
+        try: strike=float(p.get("strike") or 0)
+        except Exception: strike=0.0
+        return (0 if _opp_status(p,today)=="ACTIVE" else 1,str(p.get("ticker") or ""),str(p.get("expiry") or ""),strike)
+    positions.sort(key=sk)
+    for p in positions:
+        inst=str(p.get("instrument_type") or "OPTION").upper();ticker=html.escape(str(p.get("ticker") or ""))
+        expiry=html.escape(str(p.get("expiry") or "")) if inst=="OPTION" else "—"
+        typ=html.escape(str(p.get("option_type") or "")) if inst=="OPTION" else "EQUITY"
+        try: strike=f'{float(p.get("strike")):g}' if inst=="OPTION" else "—"
+        except Exception: strike=html.escape(str(p.get("strike") or ""))
+        try: qty=f'{float(p.get("quantity") or 0):,.0f}'
+        except Exception: qty=html.escape(str(p.get("quantity") or ""))
+        status=_opp_status(p,today);sec=html.escape(str(p.get("bloomberg_security") or ""))
+        rows.append(f'<tr><td>{ticker}</td><td>{expiry}</td><td>{typ}</td><td>{strike}</td><td>{qty}</td><td>{status}</td><td>{sec}</td></tr>')
+    if not rows:return '<p>No Opportunity portfolio positions available.</p>'
+    return '<div style="overflow-x:auto"><table><thead><tr><th>Ticker</th><th>Expiry</th><th>Type</th><th>Strike</th><th>Qty</th><th>Status</th><th>Bloomberg Security</th></tr></thead><tbody>'+''.join(rows)+'</tbody></table></div>'
+
+
+def _opp_pnl_positions_table(base):
+    rows=[]
+    for p in list((base or {}).get("positions") or []):
+        name=html.escape(_opp_position_label(p))
+        try: qty=f'{float(p.get("quantity") or 0):,.0f}'
+        except Exception: qty=html.escape(str(p.get("quantity") or ""))
+        try: mark=f'${float(p.get("baseline_price")):,.2f}'
+        except Exception: mark='—'
+        rows.append(f'<tr><td>{name}</td><td>{qty}</td><td>{mark}</td></tr>')
+    if not rows:return '<p>No Opportunity P&amp;L baseline positions available.</p>'
+    return '<div style="overflow-x:auto"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th></tr></thead><tbody>'+''.join(rows)+'</tbody></table></div>'
+
 
 def _latest_opportunity_snapshot(db):
     p=_json_setting(db,"opportunity_bloomberg_snapshot",None)
@@ -1516,9 +1702,19 @@ def opportunity_admin(request:Request):
     u=require_admin(request)
     with SessionLocal() as db:
         exp=_opportunity_exposure(db);base=_opportunity_baseline(db);limit=get_setting(db,"opportunity_limit_pct","");ver=get_setting(db,"opportunity_config_version","1")
+        hist=_opp_exposure_history(db,exp)
+        exp_changes=_json_setting(db,"opportunity_exposure_last_changes",None)
+        pnl_changes=_json_setting(db,"opportunity_pnl_last_changes",None)
     exp_txt='<p>No Opportunity Exposure report loaded.</p>' if not exp else f'<div class="notice"><strong>Exposure:</strong> {html.escape(str(exp.get("filename") or ""))} · Report {html.escape(str(exp.get("report_date") or ""))} · NAV ${float(exp.get("nav_usd") or 0):,.2f} · Delta positions {len(exp.get("positions") or [])}</div>'
     base_txt='<p>No Opportunity P&amp;L baseline loaded.</p>' if not base else f'<div class="notice"><strong>P&amp;L baseline:</strong> {html.escape(str(base.get("filename") or ""))} · Report {html.escape(str(base.get("report_date") or ""))} · NAV ${float(base.get("nav_usd") or 0):,.2f} · Daily Return positions {len(base.get("positions") or [])}</div>'
-    body=admin_tabs()+f'''<h1>Opportunity Setup</h1><div class="card"><h3>Opportunity Delta Monitor</h3><p>Upload the latest Nirvana Exposure by Underlying XLSX. This updates only Opportunity.</p><form method="post" action="/admin/opportunity/exposure-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required><button>Upload Opportunity Exposure</button></form><br>{exp_txt}</div><div class="card"><h3>Opportunity Daily Return Baseline</h3><p>Upload the previous trading day's Opportunity PNL Report as PDF or Excel (XLSX). It supplies positions, previous marks and NAV for both Bloomberg and Yahoo Daily Return. Excel is recommended when available.</p><form method="post" action="/admin/opportunity/pnl-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Opportunity P&amp;L</button></form><br>{base_txt}</div><div class="card"><h3>Opportunity Settings — Config v{html.escape(str(ver))}</h3><form method="post" action="/admin/opportunity/settings" class="row"><label>Delta Limit % (optional)<input name="limit_pct" value="{html.escape(str(limit or ''))}" placeholder="Leave blank if no limit"></label><button>Publish</button></form></div>'''
+    exp_changes_html=_opp_changes_html(exp_changes,"Changes Detected — Exposure Upload")
+    pnl_changes_html=_opp_changes_html(pnl_changes,"Changes Detected — P&amp;L Upload")
+    portfolio_html=_opp_portfolio_table(hist);pnl_positions_html=_opp_pnl_positions_table(base)
+    body=admin_tabs()+f"""<h1>Opportunity Setup</h1>
+<div class="card"><h3>Opportunity Delta Monitor</h3><p>Upload the latest Nirvana Exposure by Underlying XLSX. This updates only Opportunity.</p><form method="post" action="/admin/opportunity/exposure-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required><button>Upload Opportunity Exposure</button></form><br>{exp_txt}<br>{exp_changes_html}</div>
+<div class="card"><h3>Opportunity Portfolio</h3><p class="muted">Upload-driven history. ACTIVE positions are in the latest Exposure file; positions no longer present are ARCHIVED, and past-expiry options are shown as EXPIRED. This is display/history only and does not change Delta calculations.</p>{portfolio_html}</div>
+<div class="card"><h3>Opportunity Daily Return Baseline</h3><p>Upload the previous trading day's Opportunity PNL Report as PDF or Excel (XLSX). It supplies positions, previous marks and NAV for both Bloomberg and Yahoo Daily Return. Excel is recommended when available.</p><form method="post" action="/admin/opportunity/pnl-upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Opportunity P&amp;L</button></form><br>{base_txt}<br>{pnl_changes_html}<br><h4>Daily Return Baseline Positions</h4>{pnl_positions_html}</div>
+<div class="card"><h3>Opportunity Settings — Config v{html.escape(str(ver))}</h3><form method="post" action="/admin/opportunity/settings" class="row"><label>Delta Limit % (optional)<input name="limit_pct" value="{html.escape(str(limit or ''))}" placeholder="Leave blank if no limit"></label><button>Publish</button></form></div>"""
     return page("Opportunity Setup",body,u)
 
 @app.post("/admin/opportunity/exposure-upload")
@@ -1529,7 +1725,7 @@ async def opportunity_exposure_upload(request:Request,file:UploadFile=File(...))
     try: parsed=_parse_opportunity_exposure_xlsx(data,filename)
     except Exception as e: raise HTTPException(400,f"Could not parse Opportunity Exposure: {e}")
     with SessionLocal() as db:
-        _set_json_setting(db,"opportunity_exposure_config",parsed);_bump_opportunity_config(db,u["username"],f'Exposure {filename}; report={parsed.get("report_date")}; positions={len(parsed.get("positions") or [])}');db.commit()
+        changes=_opp_update_exposure_history(db,parsed,filename);_set_json_setting(db,"opportunity_exposure_config",parsed);audit(db,u["username"],"OPPORTUNITY_EXPOSURE_CHANGES",f'added={len(changes.get("added") or [])}; archived={len(changes.get("archived") or [])}; expired={len(changes.get("expired") or [])}; qty_changed={len(changes.get("quantity_changed") or [])}; reactivated={len(changes.get("reactivated") or [])}');_bump_opportunity_config(db,u["username"],f'Exposure {filename}; report={parsed.get("report_date")}; positions={len(parsed.get("positions") or [])}');db.commit()
     return RedirectResponse("/admin/opportunity",303)
 
 @app.post("/admin/opportunity/pnl-upload")
@@ -1545,7 +1741,7 @@ async def opportunity_pnl_upload(request:Request,file:UploadFile=File(...)):
         positions.append({**x,"id":i,"yahoo_manual_price":None,"bloomberg_manual_price":None})
     stored={"filename":filename,"report_date":parsed["report_date"],"run_date":parsed["run_date"],"nav_usd":parsed["nav_usd"],"positions":positions,"version":int(datetime.now(timezone.utc).timestamp())}
     with SessionLocal() as db:
-        _set_json_setting(db,"opportunity_daily_baseline",stored);_bump_opportunity_config(db,u["username"],f'PNL baseline {filename}; report={parsed.get("report_date")}; positions={len(positions)}');db.commit()
+        changes=_opp_pnl_changes(db,parsed,filename);_set_json_setting(db,"opportunity_daily_baseline",stored);audit(db,u["username"],"OPPORTUNITY_PNL_CHANGES",f'added={len(changes.get("added") or [])}; archived={len(changes.get("archived") or [])}; expired={len(changes.get("expired") or [])}; qty_changed={len(changes.get("quantity_changed") or [])}; reactivated={len(changes.get("reactivated") or [])}');_bump_opportunity_config(db,u["username"],f'PNL baseline {filename}; report={parsed.get("report_date")}; positions={len(positions)}');db.commit()
     return RedirectResponse("/admin/opportunity",303)
 
 @app.post("/admin/opportunity/settings")
