@@ -212,7 +212,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.13 — Opportunity Portfolio History",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.14 — Unified Fund Uploads",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -261,14 +261,14 @@ def page(title,body,user=None,refresh=None):
         elif key=="opp_bloomberg": active=(t=="opportunity bloomberg delta monitor")
         elif key=="opp_daily": active=(t=="opportunity bloomberg daily return")
         elif key=="opp_yahoo": active=(t=="opportunity yahoo daily return")
-        elif key=="admin": active=t in {"admin","opportunity setup","users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
+        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
         return "active" if active else ""
 
-    admin_titles={"admin","opportunity setup","users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
+    admin_titles={"admin","fortress setup","opportunity setup","users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
     is_admin_page=bool(user and user.get("username")==ADMIN_USER and str(title or "").lower() in admin_titles)
 
     if user:
-        adminlink=(f'<a href="/admin" class="nav-short {nav_class("admin")}"><span class="nav-single">Admin</span></a>' if user["username"]==ADMIN_USER else "")
+        adminlink=(f'<a href="/admin/fortress" class="nav-short {nav_class("admin")}"><span class="nav-single">Admin</span></a>' if user["username"]==ADMIN_USER else "")
         display_user=html.escape(str(user["username"]).capitalize())
         auth=(
             f'<a href="/overview" class="nav-two nav-overview {nav_class("overview")}"><span>Overview</span><strong aria-hidden="true">&nbsp;</strong></a>'
@@ -292,16 +292,14 @@ def page(title,body,user=None,refresh=None):
           '<div class="admin-side-title"><span>Admin</span></div>'
           '<a class="side-main" href="/overview">Dashboard / Overview</a>'
           '<div class="side-group"><div class="side-group-title">Fortress Fund</div>'
-          f'<a href="/admin/daily-return" class="{sactive("daily return upload")}">PNL Upload</a>'
-          f'<a href="/admin/import" class="{sactive("nirvana import","nirvana import preview","map import","import preview")}">Delta Positions</a>'
-          '<a href="/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/daily-return">Yahoo Daily Return</a></div>'
+          f'<a href="/admin/fortress" class="{sactive("fortress setup","nirvana import","nirvana import preview","map import","import preview","daily return upload")}">PNL / Exposure Upload</a>'
+          '<a href="/">Delta Positions</a><a href="/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group"><div class="side-group-title">Opportunity Fund</div>'
           f'<a href="/admin/opportunity" class="{sactive("opportunity setup")}">PNL / Exposure Upload</a>'
           '<a href="/opportunity">Delta Positions</a><a href="/opportunity/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/opportunity/yahoo-daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group side-tools">'
           f'<a href="/admin/users" class="{sactive("users")}">User Management</a>'
-          f'<a href="/admin/audit" class="{sactive("audit")}">Logs</a>'
-          f'<a href="/admin" class="{sactive("admin")}">Settings / Portfolio</a></div></aside>'
+          f'<a href="/admin/audit" class="{sactive("audit")}">Logs</a></div></aside>'
         )
 
     rf=f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
@@ -1783,21 +1781,36 @@ async def opportunity_manual_price(request:Request):
 
 @app.get("/admin")
 def admin_home(request:Request):
+    require_admin(request)
+    return RedirectResponse("/admin/fortress",303)
+
+@app.get("/admin/fortress")
+def fortress_setup(request:Request):
     u=require_admin(request)
     with SessionLocal() as db:
-        nav=get_setting(db,"nav_usd","");limit=get_setting(db,"limit_pct","15");ver=get_setting(db,"config_version","1");nav_display=f"{float(nav):,.2f}"
-        pos=db.query(Position).order_by(Position.active.desc(),Position.ticker,Position.expiry,Position.strike).all()
-        today=date.today().isoformat();rows=""
-        for p in pos:
-            status="EXPIRED" if p.expiry<today else ("ACTIVE" if p.active else "ARCHIVED")
-            action="" if not p.active else f"""<form method="post" action="/admin/positions/{p.id}/quantity" style="display:inline"><input name="quantity" value="{p.quantity:g}" size="7"><button>Qty</button></form>
-<form method="post" action="/admin/positions/{p.id}/archive" style="display:inline"><button class="danger">Archive</button></form>"""
-            rows+=f'<tr><td>{p.ticker}</td><td>{p.expiry}</td><td>{p.option_type}</td><td>{p.strike:g}</td><td>{p.quantity:,.0f}</td><td>{status}</td><td>{html.escape(p.bloomberg_security)}</td><td>{action}</td></tr>'
-        body=admin_tabs()+f"""<div class="card"><h2>Admin — Fuat only</h2><div class="notice">Only Fuat can change portfolio, NAV, limit and users. Viewers are read-only.</div></div>
-<div class="card"><h3>Fund Settings — Config v{ver}</h3><form method="post" action="/admin/settings" class="row"><label>NAV USD<input name="nav_usd" value="{nav_display}"></label><label>Delta Limit %<input name="limit_pct" value="{limit}"></label><button>Publish</button></form></div>
-<div class="card"><h3>Add Position</h3><form method="post" action="/admin/positions/add" class="row"><label>Ticker<input name="ticker" required></label><label>Expiry YYYY-MM-DD<input name="expiry" required></label><label>Type<select name="option_type"><option>P</option><option>C</option></select></label><label>Strike<input name="strike" required></label><label>Qty<input name="quantity" required></label><label>Multiplier<input name="multiplier" value="100"></label><button>Add & Publish</button></form></div>
-<div class="card"><h3>Portfolio</h3><table><thead><tr><th>Ticker</th><th>Expiry</th><th>Type</th><th>Strike</th><th>Qty</th><th>Status</th><th>Bloomberg Security</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>"""
-        return page("Admin",body,u)
+        nav=float(get_setting(db,"nav_usd","0") or 0)
+        ver=get_setting(db,"config_version","1")
+        active_count=db.query(Position).filter_by(active=True).count()
+        b=_active_daily_baseline(db)
+        current='<p class="muted">No P&amp;L baseline loaded.</p>'
+        if b:
+            pos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.id).all()
+            prows=''
+            for p in pos:
+                strike='' if p.strike is None else f"{p.strike:g}"
+                name=f"{p.ticker} {p.expiry} {p.option_type}{strike}" if p.instrument_type=="OPTION" else p.ticker
+                prows+=f'<tr><td>{html.escape(name)}</td><td>{p.quantity:,.0f}</td><td>${p.baseline_price:.2f}</td></tr>'
+            current=f'''<div class="notice"><strong>Active baseline:</strong> {html.escape(b.filename)} · Report {html.escape(b.report_date)} · NAV ${b.nav_usd:,.2f} · Positions {len(pos)}</div><br><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th></tr></thead><tbody>{prows}</tbody></table>'''
+
+    body=admin_tabs()+f'''<h1>Fortress Setup</h1>
+<div class="card"><h3>Fortress Delta Monitor — Exposure Upload</h3>
+<p>Upload the latest Nirvana <strong>Exposure Summary by Underlying</strong> XLSX. The portal reads option positions, quantities and NAV, then shows a change preview before anything is published.</p>
+<form method="post" action="/admin/import" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx,.csv" required><button>Upload Fortress Exposure</button></form><br>
+<div class="notice"><strong>Current Delta config:</strong> v{html.escape(str(ver))} · NAV ${nav:,.2f} · Active Delta positions {active_count}</div></div>
+<div class="card"><h3>Fortress Daily Return Baseline — P&amp;L Upload</h3>
+<p>Upload the previous trading day's Nirvana <strong>PNL Report</strong> as PDF or Excel (XLSX). It supplies positions, quantities, previous marks and NAV for both Bloomberg and Yahoo Daily Return.</p>
+<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Fortress P&amp;L</button></form><br>{current}</div>'''
+    return page("Fortress Setup",body,u)
 
 @app.post("/admin/settings")
 def settings_update(request:Request,nav_usd:str=Form(...),limit_pct:str=Form(...)):
@@ -1900,11 +1913,8 @@ def audit_page(request:Request):
 
 @app.get("/admin/import")
 def import_get(request:Request):
-    u=require_admin(request)
-    return page("Nirvana Import",admin_tabs()+"""<div class="card"><h2>Nirvana Position Import</h2>
-<p>Upload the Nirvana <strong>Exposure Summary by Underlying</strong> XLSX directly. The portal recognizes this report automatically, extracts the real option rows, NAV and quantities, then shows a preview before anything changes.</p>
-<p class="muted">Generic CSV/XLSX files are still supported with manual column mapping.</p>
-<form method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx,.csv" required><button>Upload & Preview</button></form></div>""",u)
+    require_admin(request)
+    return RedirectResponse("/admin/fortress",303)
 
 def _compare_import(parsed,current):
     cur={keypos(x):x for x in current};new={keypos(x):x for x in parsed}
@@ -1930,7 +1940,7 @@ def _preview_html(jid,parsed,errors,current,mapping,report_nav=None,current_nav=
     mj=quote(json.dumps(mapping))
     return admin_tabs()+f"""<div class="card"><h2>Import Preview</h2><p><strong>{source}</strong></p>{navline}
 <p><strong>Parsed option positions:</strong> {len(parsed)} · <strong>Added:</strong> {len(added)} · <strong>Changed:</strong> {len(changed)} · <strong>Missing:</strong> {len(missing)} · <strong>Parse errors:</strong> {len(errors)}</p>{detail}
-<form method="post" action="/admin/import/{jid}/apply"><input type="hidden" name="mapping_json" value="{html.escape(mj)}"><label>Mode<select name="mode"><option value="replace">Replace active portfolio — missing positions archived</option><option value="merge">Merge/update only — missing positions untouched</option></select></label><br><br><button>Confirm & Publish</button> <a href="/admin/import">Cancel</a></form></div>"""
+<form method="post" action="/admin/import/{jid}/apply"><input type="hidden" name="mapping_json" value="{html.escape(mj)}"><label>Mode<select name="mode"><option value="replace">Replace active portfolio — missing positions archived</option><option value="merge">Merge/update only — missing positions untouched</option></select></label><br><br><button>Confirm & Publish</button> <a href="/admin/fortress">Cancel</a></form></div>"""
 
 @app.post("/admin/import")
 async def import_upload(request:Request,file:UploadFile=File(...)):
@@ -2012,7 +2022,7 @@ def import_apply(request:Request,jid:str,mapping_json:str=Form(...),mode:str=For
         audit(db,u["username"],"NIRVANA_IMPORT_APPLIED",f"{job.filename}; mode={mode}; added={added}; changed={changed}; archived={archived}; parse_errors={len(errors)}{nav_note}")
         config_bump(db,u["username"],f"Nirvana import {job.filename}")
         db.delete(job);db.commit()
-    return RedirectResponse("/admin",303)
+    return RedirectResponse("/admin/fortress",303)
 
 def _active_daily_baseline(db):
     return db.query(DailyReturnBaseline).filter_by(active=True).order_by(DailyReturnBaseline.id.desc()).first()
@@ -2328,29 +2338,8 @@ Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.
 
 @app.get("/admin/daily-return")
 def daily_return_admin(request:Request):
-    u=require_admin(request)
-    with SessionLocal() as db:
-        b=_active_daily_baseline(db)
-        current="<p>No P&amp;L baseline loaded.</p>"
-        if b:
-            pos=db.query(DailyReturnPosition).filter_by(baseline_id=b.id).order_by(DailyReturnPosition.id).all()
-            prows=""
-            for p in pos:
-                strike="" if p.strike is None else f"{p.strike:g}"
-                name=f"{p.ticker} {p.expiry} {p.option_type}{strike}" if p.instrument_type=="OPTION" else p.ticker
-                prows+=f'<tr><td>{html.escape(name)}</td><td>{p.quantity:,.0f}</td><td>${p.baseline_price:.2f}</td></tr>'
-            current=f'''<div class="notice"><strong>Active baseline:</strong> {html.escape(b.filename)} · Report {html.escape(b.report_date)} · NAV ${b.nav_usd:,.2f} · Positions {len(pos)}</div><br><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th></tr></thead><tbody>{prows}</tbody></table>'''
-
-    body=admin_tabs()+f'''
-<div class="card"><h2>Daily Return — P&amp;L Baseline</h2>
-<p>Upload the previous trading day's Nirvana <strong>PNL Report</strong> as PDF or Excel (XLSX). The file supplies positions, quantities, previous marks and NAV and is shared by both Bloomberg Daily Return and Yahoo Daily Return. Excel is recommended when available.</p>
-<form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload P&amp;L Baseline</button></form><br>{current}</div>
-<div class="card"><h3>Calculation</h3>
-<p><strong>Current Mark = (Yahoo Bid + Yahoo Ask) ÷ 2 when both are available; otherwise Yahoo Last.</strong></p>
-<p><strong>Position P&amp;L = (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier</strong></p>
-<p><strong>Estimated Daily Return = Total Estimated P&amp;L ÷ P&amp;L Report NAV</strong></p>
-<p class="muted">No Exposure-by-Underlying upload is required. Yahoo option-chain expiration discovery is not used. This Daily Return module is separate from Bloomberg and does not change Bloomberg positions, NAV, Collector, snapshots, config version, users or limits.</p></div>'''
-    return page("Daily Return Upload",body,u)
+    require_admin(request)
+    return RedirectResponse("/admin/fortress",303)
 
 
 @app.post("/admin/daily-return/manual-price")
@@ -2423,7 +2412,7 @@ async def daily_return_upload(request:Request,file:UploadFile=File(...)):
               f'{filename}; report_date={parsed["report_date"]}; nav={parsed["nav_usd"]}; positions={len(parsed["positions"])}')
         db.commit()
 
-    return RedirectResponse("/admin/daily-return",303)
+    return RedirectResponse("/admin/fortress",303)
 
 def collector_auth(request):
     if not COLLECTOR_TOKEN or not hmac.compare_digest(request.headers.get("authorization",""),f"Bearer {COLLECTOR_TOKEN}"):
