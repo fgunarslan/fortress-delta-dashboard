@@ -212,7 +212,7 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.15 — Intraday & Expiration",docs_url=None,redoc_url=None)
+app=FastAPI(title="RPD Fund Management v6.15.1 — Automatic Expiration",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -784,22 +784,104 @@ def _overlay_positions(baseline_positions,trades,include_flat=False):
         p["quantity"]=float(p.get("quantity") or 0)+float(t["signed_quantity"])
     return [p for p in result.values() if include_flat or abs(float(p.get("quantity") or 0))>1e-7]
 
+# v6.15.1: automatic post-close OTM estimate from Bloomberg underlying spot.
+# This is explicitly a PROVISIONAL valuation, NOT exercise/assignment confirmation.
+AUTO_OTM_MIN_PCT = 2.0
+AUTO_OTM_MIN_USD = 0.10
+
+def _expiry_record_status(db, fund):
+    # Most recent record per instrument; include CLEAR (= block auto) and RESUME.
+    return {_dr_position_key(x):str(x.get("status") or "") for x in _expiry_history(db,fund)}
+
+def _closing_bloomberg_snapshot(db, fund, expiry_day):
+    snap = latest_snapshot(db)[0] if fund=="fortress" else _latest_opportunity_snapshot(db)[0]
+    if not isinstance(snap, dict) or str(snap.get("mode") or "")!="MARKET_CLOSED":
+        return None, "Bloomberg final closing snapshot is unavailable"
+    try:
+        ts=datetime.fromisoformat(str(snap.get("timestamp_utc") or "").replace("Z","+00:00"))
+        if ts.tzinfo is None:return None,"Snapshot timestamp has no timezone"
+        ts=ts.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return None,"Bloomberg closing timestamp is invalid"
+    if ts.date().isoformat()!=expiry_day or not (ts.hour==16 and ts.minute<=45):
+        return None,"No Bloomberg closing snapshot for this expiration date"
+    return snap,""
+
+def _auto_expiry_assessment(db,fund,report_date,baseline_positions,trades=None,as_of=None):
+    """Read-only decision. Never silently write expirations, change the baseline,
+    or treat a quote as official exercise/assignment confirmation.
+    Fail closed if spot is missing, snapshot is wrong date, or underlying is near strike.
+    """
+    now=_ny_now();today=str(as_of or now.date().isoformat())
+    latest=_expiry_record_status(db,fund)
+    effective=_overlay_positions(baseline_positions, trades if trades is not None else _active_trades(db,fund,report_date,today))
+    choices={}
+    for p in effective:
+        if str(p.get("instrument_type") or "OPTION").upper()!="OPTION":continue
+        expiry=str(p.get("expiry") or "")
+        if not (report_date < expiry <= today):continue
+        key=_dr_position_key(p);state=latest.get(key)
+        result={"status":"REVIEW","reason":"Pending Bloomberg closing quote", "underlying":None, "otm_pct":None, "snapshot_at":""}
+        if state=="CONFIRMED_WORTHLESS":
+            result.update(status="CONFIRMED",reason="Manually verified worthless")
+            choices[key]=result;continue
+        if state=="CLEARED":
+            result.update(status="BLOCKED",reason="Excluded by admin (undo confirmation)")
+            choices[key]=result;continue
+        if expiry==today and (now.hour,now.minute)<(16,0):
+            result.update(status="WAIT",reason="Expiration day: wait until 4:00 PM New York")
+            choices[key]=result;continue
+        snap,why=_closing_bloomberg_snapshot(db,fund,expiry)
+        if snap is None:
+            result["reason"]=why;choices[key]=result;continue
+        result["snapshot_at"]=str(snap.get("timestamp_utc") or "")
+        # Some Bloomberg feeds can duplicate the same instrument in the payload;
+        # never infer spot from a different contract, symbol, Delta, or quote source.
+        matching=[r for r in (snap.get("positions") or []) if _dr_position_key(r)==key]
+        if not matching:
+            result["reason"]="Instrument missing from Bloomberg final snapshot";choices[key]=result;continue
+        spot_raw=matching[-1].get("underlying_spot")
+        try:spot=float(spot_raw)
+        except (ValueError,TypeError):spot=0.0
+        src=str(matching[-1].get("spot_source") or "")
+        if not (math.isfinite(spot) and spot>0 and src in ("OPT_UNDL_PX","UNDERLYING_BID_ASK_MID","UNDERLYING_PX_LAST")):
+            result["reason"]="Underlying closing-window price unavailable/unverified (Collector v4.2 needed)"
+            choices[key]=result;continue
+        strike=float(p.get("strike") or 0)
+        typ=str(p.get("option_type") or "").upper()
+        if not (math.isfinite(strike) and strike>0 and typ in ("P","C")):
+            result["reason"]="Invalid option contract";choices[key]=result;continue
+        # Put: spot > strike. Call: spot < strike.
+        distance=(spot-strike) if typ=="P" else (strike-spot)
+        pct=distance/spot*100
+        result["underlying"]=spot;result["otm_pct"]=pct
+        if distance<=0:
+            result.update(status="REVIEW",reason="ITM/ATM at Bloomberg closing-window price: do not zero")
+        elif distance<max(AUTO_OTM_MIN_USD, spot*AUTO_OTM_MIN_PCT/100):
+            result.update(status="REVIEW",reason="Near strike: assignment/exercise risk review")
+        else:
+            result.update(status="AUTO",reason="Provisional OTM = estimated $0; exercise/assignment not confirmed")
+        choices[key]=result
+    return choices
+
 def _confirmed_expiry_keys(db,fund,baseline_day,as_of=None):
     as_of=as_of or _ny_now().date().isoformat()
     return {_dr_position_key(x) for x in _expiry_history(db,fund)
             if x.get("status")=="CONFIRMED_WORTHLESS" and baseline_day < x.get("expiry","") <= as_of}
 
 def _daily_with_ledger(db,fund,source,positions,nav,snapshot,baseline_date):
-    """Existing pricing rules are untouched; overlay trade cash flows only."""
+    """v6.15 unchanged pricing plus intraday cash flows and v6.15.1 provisional expiry."""
     if source=="bloomberg":
         calc=_calc_bloomberg_daily(positions,nav,snapshot)
     else:
         quotes=_quote_data_from_snapshot(snapshot)
         calc=calculate_mark_to_market_return(positions,nav,quote_data=quotes)
-    trades=_active_trades(db,fund,str(baseline_date or ""))
-    expired=_confirmed_expiry_keys(db,fund,str(baseline_date or ""))
-    if not trades and not expired:
-        return calc
+    day=str(baseline_date or "")
+    trades=_active_trades(db,fund,day)
+    expiry_status=_auto_expiry_assessment(db,fund,day,positions,trades)
+    zero_keys={k for k,r in expiry_status.items() if r["status"] in ("AUTO","CONFIRMED")}
+    if not trades and not zero_keys:
+        return {**calc,"auto_expiry_count":0,"expiry_review_count":sum(1 for x in expiry_status.values() if x["status"]=="REVIEW")}
     raw={_dr_position_key(p):dict(p) for p in positions}
     rows={_dr_position_key(r):dict(r) for r in calc.get("rows",[])}
     legs={}
@@ -808,7 +890,6 @@ def _daily_with_ledger(db,fund,source,positions,nav,snapshot,baseline_date):
         if k not in raw: raw[k]=_trade_to_position(t)
     for k,p in raw.items():
         if k in rows: continue
-        # Price a newly traded instrument through the original mark-selection engine.
         if source=="bloomberg":
             fresh=_calc_bloomberg_daily([p],nav,snapshot)
         else:
@@ -821,11 +902,13 @@ def _daily_with_ledger(db,fund,source,positions,nav,snapshot,baseline_date):
         dq=sum(float(t["signed_quantity"]) for t in ls)
         net=round(q0+dq,9)
         mark=r.get("current_mark")
-        confirmed=k in expired
-        if confirmed:
-            mark=0.0;r["current_mark"]=0.0;r["effective_source"]="VERIFIED EXPIRED WORTHLESS"
+        expiry_info=expiry_status.get(k)
+        zero=k in zero_keys
+        if zero:
+            mark=0.0;r["current_mark"]=0.0
+            r["effective_source"]=("VERIFIED EXPIRED WORTHLESS" if expiry_info["status"]=="CONFIRMED"
+                                   else "AUTO OTM EXPIRY ($0 ESTIMATE)")
         if mark is None and abs(net)<1e-8:
-            # Full intra-day close: current mark cancels algebraically; still has realized P&L.
             mark=0.0;r["current_mark"]=0.0;r["effective_source"]="CLOSED (TRADE CASH FLOWS)"
         previous=p.get("baseline_price")
         multiplier=float(p.get("multiplier") or 1)
@@ -835,17 +918,20 @@ def _daily_with_ledger(db,fund,source,positions,nav,snapshot,baseline_date):
             pnl+=sum(float(t["signed_quantity"])*(float(mark)-float(t["execution_price"]))*multiplier for t in ls)
             total+=pnl;valid+=1
         r["base_quantity"]=q0;r["quantity"]=net;r["intraday_trades"]=len(ls)
-        r["expired_confirmed"]=confirmed;r["estimated_pnl"]=pnl
+        r["expired_confirmed"]=bool(expiry_info and expiry_info["status"]=="CONFIRMED")
+        r["expired_auto_estimate"]=bool(expiry_info and expiry_info["status"]=="AUTO")
+        r["estimated_pnl"]=pnl
         r["contribution_pct"]=pnl/float(nav)*100 if pnl is not None and nav else None
         r["change"]=float(mark)-float(previous) if mark is not None and previous is not None else None
-        r["baseline_price"]=previous
-        r["previous_mark"]=previous
+        r["baseline_price"]=previous;r["previous_mark"]=previous
         newrows.append(r)
     return {**calc,"rows":newrows,"estimated_pnl":total,
             "estimated_return_pct":total/float(nav)*100 if nav else 0.0,
             "coverage_valid":valid,"coverage_total":len(newrows),
             "complete":bool(newrows and valid==len(newrows)),
-            "intraday_count":len(trades),"expired_confirmed_count":len(expired)}
+            "intraday_count":len(trades),"expired_confirmed_count":sum(1 for r in expiry_status.values() if r["status"]=="CONFIRMED"),
+            "auto_expiry_count":sum(1 for r in expiry_status.values() if r["status"]=="AUTO"),
+            "expiry_review_count":sum(1 for r in expiry_status.values() if r["status"]=="REVIEW")}
 
 def _version_bump_for_trade(db,fund,actor,reason):
     if fund=="fortress":
@@ -870,21 +956,36 @@ def _intraday_panel(db,fund):
         remove=(f'<form method="post" action="/admin/intraday/{fund}/cancel" onsubmit="return confirm(\'Cancel this trade?\');"><input type="hidden" name="trade_id" value="{html.escape(str(t["id"]))}"><button type="submit">Cancel</button></form>' if status=="Active" else "—")
         trade_rows.append(f'<tr><td>{html.escape(str(t.get("trade_date")))}</td><td>{html.escape(_opp_position_label(t))}</td><td>{html.escape(str(t.get("action")))}</td><td>{float(t.get("signed_quantity") or 0):+,.0f}</td><td>${float(t.get("execution_price") or 0):.4f}</td><td>{status}</td><td>{remove}</td></tr>')
     exp_rows=[]
-    confirmed=_confirmed_expiry_keys(db,fund,report,today)
     now=_ny_now()
+    assessments=_auto_expiry_assessment(db,fund,report,baseline,active)
     for pos in _overlay_positions(baseline,active):
-        if str(pos.get("instrument_type") or "OPTION").upper()!="OPTION": continue
+        if str(pos.get("instrument_type") or "OPTION").upper()!="OPTION":continue
         expiry=str(pos.get("expiry") or "")
-        if not expiry or expiry>today or expiry<=report:continue
-        k=_dr_position_key(pos); done=k in confirmed
-        if expiry==today and now.hour<16:continue
+        if not expiry or expiry<=report or expiry>today:continue
+        k=_dr_position_key(pos);a=assessments.get(k) or {}
+        status=a.get("status","REVIEW")
         params=''.join(f'<input type="hidden" name="{f}" value="{html.escape(str(pos.get(f) or ""))}">' for f in ("ticker","expiry","option_type","strike"))
         label=html.escape(_opp_position_label(pos))
-        button=(f'<form method="post" action="/admin/intraday/{fund}/expiration">{params}<input type="hidden" name="operation" value="clear"><button>Undo confirmation</button></form>' if done else
-                f'<form method="post" action="/admin/intraday/{fund}/expiration" onsubmit="return confirm(\'Confirm worthless expiration / no assignment for {label}?\');">{params}<input type="hidden" name="operation" value="confirm"><button>Confirm worthless</button></form>')
-        exp_rows.append(f'<tr><td>{label}</td><td>{"Confirmed worthless" if done else "Needs verification"}</td><td>{button}</td></tr>')
+        price=('—' if a.get("underlying") is None else f'${a["underlying"]:,.2f}')
+        distance=('—' if a.get("otm_pct") is None else f'{a["otm_pct"]:+.2f}%')
+        detail=html.escape(str(a.get("reason") or ""))
+        if status=="CONFIRMED":
+            action=f'<form method="post" action="/admin/intraday/{fund}/expiration">{params}<input type="hidden" name="operation" value="clear"><button>Undo / exclude auto</button></form>'
+            label_status="Verified manually"
+        elif status=="BLOCKED":
+            action=f'<form method="post" action="/admin/intraday/{fund}/expiration">{params}<input type="hidden" name="operation" value="resume"><button>Resume auto</button></form>'
+            label_status="Excluded by admin"
+        elif status=="AUTO":
+            action=f'<form method="post" action="/admin/intraday/{fund}/expiration">{params}<input type="hidden" name="operation" value="clear"><button>Exclude auto</button></form>'
+            label_status="Estimated worthless · automatic"
+        elif status=="WAIT":
+            action="—";label_status="Expiring today · monitoring"
+        else:
+            action=(f'<form method="post" action="/admin/intraday/{fund}/expiration" onsubmit="return confirm(\'Only confirm if no exercise/assignment for {label}.\');">{params}<input type="hidden" name="operation" value="confirm"><button>Confirm manually</button></form>')
+            label_status="Review needed"
+        exp_rows.append(f'<tr><td>{label}</td><td>{price}</td><td>{distance}</td><td>{html.escape(label_status)}<br><span class="muted">{detail}</span></td><td>{action}</td></tr>')
     sel=''.join(position_lines)
-    return f'''<div class="card"><h3>Intraday Trade Management · {fund.title()} (v6.15)</h3>
+    return f'''<div class="card"><h3>Intraday Trade Management · {fund.title()} (v6.15.1)</h3>
 <div class="notice"><strong>Baseline report: {html.escape(report or "UNKNOWN")}</strong>. Trades dated AFTER this baseline are added to Daily Return and Delta. Signed quantity +BUY / -SELL. Execution price per share/contract unit, NOT total premium. Record each fill. New uploads absorb already-reported trades without deleting history.</div>
 <form method="post" action="/admin/intraday/{fund}/add" class="row">
 <label>Action<select name="action" required><option value="OPEN">Open Position</option><option value="INCREASE">Increase Position</option><option value="REDUCE">Reduce Position</option><option value="CLOSE">Close Position</option></select></label>
@@ -900,9 +1001,9 @@ def _intraday_panel(db,fund):
 <label>Note<input name="note" maxlength="200"></label><button type="submit">Save Trade &amp; Publish Collector Config</button></form>
 <p class="muted">For existing positions, select the instrument from the dropdown. For Open, fill the instrument fields. Quantity is absolute; Close automatically uses the entire remaining position. Default option multiplier: 100, equity: 1. Admin-only and audit logged.</p>
 <h4>Recent trades</h4><div style="overflow-x:auto"><table><thead><tr><th>Trade Date</th><th>Instrument</th><th>Action</th><th>Signed Qty</th><th>Execution</th><th>Status</th><th>Correction</th></tr></thead><tbody>{''.join(trade_rows) or '<tr><td colspan="7">No intraday trades.</td></tr>'}</tbody></table></div>
-<h4>Expiration Reconciliation · confirm ONLY after verifying worthless expiration and no exercise / assignment</h4>
-<p class="muted">Expiry candidates appear after 4 PM New York on the expiry date; no automatic OTM assumption. This confirmation changes Daily Return MARK to $0; it does not delete a Nirvana position.</p>
-<table><thead><tr><th>Expiring Option</th><th>Status</th><th>Action</th></tr></thead><tbody>{''.join(exp_rows) or '<tr><td colspan="3">No expired baseline options awaiting confirmation.</td></tr>'}</tbody></table></div>'''
+<h4>Expiration Reconciliation · automatic OTM estimate (v6.15.1)</h4>
+<p class="muted">On expiration day before the New York close: monitoring only. After the Bloomberg MARKET CLOSED snapshot at 16:00–16:45 ET, positions that are clearly OTM (at least 2% of the underlying price AND $0.10 from strike) are marked at estimated $0 automatically for <strong>both</strong> Daily Returns. Near-strike, ITM, missing or stale-price options are NOT automatically zeroed. This is an <strong>estimated</strong> return, NOT proof of no exercise/assignment. No Nirvana position or baseline is deleted. Admin can exclude auto for a position. The Bloomberg Collector must include underlying_spot and spot_source (v4.2).</p>
+<table><thead><tr><th>Expiring Option</th><th>Bloomberg Underlying</th><th>OTM %</th><th>Estimate / Risk</th><th>Action</th></tr></thead><tbody>{''.join(exp_rows) or '<tr><td colspan="5">No expiration candidates after active baseline.</td></tr>'}</tbody></table></div>'''
 
 @app.post("/admin/intraday/{fund}/add")
 async def intraday_trade_add(request:Request,fund:str):
@@ -1021,7 +1122,7 @@ async def intraday_expiration(request:Request,fund:str):
     if typ not in ("P","C") or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}",ticker) or not math.isfinite(strike) or strike<=0:
         raise HTTPException(400,"Invalid option")
     operation=str(form.get("operation") or "")
-    if operation not in ("confirm","clear"):raise HTTPException(400,"Invalid operation")
+    if operation not in ("confirm","clear","resume"):raise HTTPException(400,"Invalid operation")
     with SessionLocal() as db:
         baseline_day,pos=_base_for_trade(db,fund)
         record={"ticker":ticker,"instrument_type":"OPTION","expiry":expiry,"option_type":typ,"strike":strike}
@@ -1031,7 +1132,7 @@ async def intraday_expiration(request:Request,fund:str):
             raise HTTPException(400,"Option is not present in the active daily position set")
         old=_expiry_history(db,fund)
         old=[x for x in old if _dr_position_key(x)!=_dr_position_key(record)]
-        old.append({**record,"status":"CONFIRMED_WORTHLESS" if operation=="confirm" else "CLEARED",
+        old.append({**record,"status":"CONFIRMED_WORTHLESS" if operation=="confirm" else ("RESUMED" if operation=="resume" else "CLEARED"),
                     "actor":u["username"],"updated_at":utcnow().isoformat()})
         _set_json_setting(db,f"expiration_confirm_v615_{fund}",old)
         _version_bump_for_trade(db,fund,u["username"],f'Expiration {operation}: {_opp_position_label(record)}')
@@ -1382,6 +1483,8 @@ def _collect_daily_export(fund_key,source_key):
         ("Baseline Report Date",str(baseline.get("report_date") or "")),
         ("Baseline File",str(baseline.get("filename") or "")),
         ("Coverage",f'{calc.get("coverage_valid",0)}/{calc.get("coverage_total",0)}'),
+        ("Auto OTM estimate count",int(calc.get("auto_expiry_count") or 0)),
+        ("OTM estimates note","PROVISIONAL — not an assignment confirmation" if calc.get("auto_expiry_count") else "None"),
         ("Snapshot (New York)",format_new_york_time(snapshot_ts) if snapshot_ts else "-"),
     ]
 
@@ -1984,7 +2087,7 @@ def _render_opportunity_yahoo(request:Request):
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
         rows+=f'<tr><td>{html.escape(posname)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("previous_mark"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
     warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Yahoo local collector has not supplied a usable current mark for every Opportunity position.</div><br>'
-    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless expirations use a zero mark.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Opportunity Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/opportunity/yahoo-daily-return")
@@ -2130,6 +2233,14 @@ def fortress_setup(request:Request):
 <p>Upload the previous trading day's Nirvana <strong>PNL Report</strong> as PDF or Excel (XLSX). It supplies positions, quantities, previous marks and NAV for both Bloomberg and Yahoo Daily Return.</p>
 <form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Fortress P&amp;L</button></form><br>{current}</div>'''
     with SessionLocal() as db:
+        today=_ny_now().date().isoformat()
+        portfolio=db.query(Position).order_by(Position.ticker,Position.expiry,Position.strike).all()
+        prows=[]
+        for item in portfolio:
+            status=("EXPIRED" if str(item.expiry or "")<today else ("ACTIVE" if item.active else "ARCHIVED"))
+            sec=html.escape(str(item.bloomberg_security or ""))
+            prows.append(f'<tr><td>{html.escape(str(item.ticker))}</td><td>{html.escape(str(item.expiry))}</td><td>{html.escape(str(item.option_type))}</td><td>{float(item.strike):g}</td><td>{float(item.quantity):,.0f}</td><td>{status}</td><td>{sec}</td></tr>')
+        body+='''<div class="card"><h3>Fortress Portfolio</h3><p class="muted">Read-only Exposure portfolio. Positions come from the current Nirvana upload and database; EXPIRED / ARCHIVED are displayed for reference only. Intraday trades are managed below, not here.</p><div style="overflow-x:auto"><table><thead><tr><th>Ticker</th><th>Expiry</th><th>Type</th><th>Strike</th><th>Qty</th><th>Status</th><th>Bloomberg Security</th></tr></thead><tbody>{''.join(prows) or '<tr><td colspan="7">No portfolio positions.</td></tr>'}</tbody></table></div></div>'''
         body+=_intraday_panel(db,"fortress")
     return page("Fortress Setup",body,u)
 
@@ -2489,7 +2600,7 @@ def daily_return_page(request:Request):
 <div class="card">
 <div class="muted">Daily Return baseline — completely separate from Bloomberg</div>
 <strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
-<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark is supplied by the local Yahoo Collector: Bid/Ask midpoint when both are available; if Bid is zero/unavailable and Ask is available, Ask/2; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless expirations use a zero mark. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
+<br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark is supplied by the local Yahoo Collector: Bid/Ask midpoint when both are available; if Bid is zero/unavailable and Ask is available, Ask/2; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
@@ -2596,7 +2707,7 @@ def bloomberg_daily_return_page(request:Request):
 Bloomberg snapshot: {html.escape(format_new_york_time(snapshot_ts)) if snapshot_ts else '—'}
 {(' · Collector: '+html.escape(collector_id)) if collector_id else ''}
 <br>Current Mark = Bloomberg option Bid/Ask midpoint when both are available; otherwise Bloomberg Last.
-Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless expirations use a zero mark.
+Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark.
 Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.
 </div></div>
 <div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
