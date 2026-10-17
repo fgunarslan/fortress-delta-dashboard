@@ -2224,23 +2224,36 @@ def fortress_setup(request:Request):
                 prows+=f'<tr><td>{html.escape(name)}</td><td>{p.quantity:,.0f}</td><td>${p.baseline_price:.2f}</td></tr>'
             current=f'''<div class="notice"><strong>Active baseline:</strong> {html.escape(b.filename)} · Report {html.escape(b.report_date)} · NAV ${b.nav_usd:,.2f} · Positions {len(pos)}</div><br><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th></tr></thead><tbody>{prows}</tbody></table>'''
 
+    # Keep the same screen order and shared portfolio-table renderer as Opportunity:
+    # Exposure Upload -> Portfolio -> P&L Upload -> Intraday -> Expiration.
     body=admin_tabs()+f'''<h1>Fortress Setup</h1>
 <div class="card"><h3>Fortress Delta Monitor — Exposure Upload</h3>
 <p>Upload the latest Nirvana <strong>Exposure Summary by Underlying</strong> XLSX. The portal reads option positions, quantities and NAV, then shows a change preview before anything is published.</p>
 <form method="post" action="/admin/import" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx,.csv" required><button>Upload Fortress Exposure</button></form><br>
-<div class="notice"><strong>Current Delta config:</strong> v{html.escape(str(ver))} · NAV ${nav:,.2f} · Active Delta positions {active_count}</div></div>
-<div class="card"><h3>Fortress Daily Return Baseline — P&amp;L Upload</h3>
+<div class="notice"><strong>Current Delta config:</strong> v{html.escape(str(ver))} · NAV ${nav:,.2f} · Active Delta positions {active_count}</div></div>'''
+    with SessionLocal() as db:
+        portfolio=db.query(Position).all()
+        # Use EXACTLY the same table HTML and ordering used on Opportunity Setup.
+        # This only reads the existing Fortress rows.  It never changes positions,
+        # active flags, exposure config, P&L baseline, or collector data.
+        entries=[{
+            "ticker":item.ticker,
+            "expiry":item.expiry,
+            "instrument_type":"OPTION",
+            "option_type":item.option_type,
+            "strike":item.strike,
+            "quantity":item.quantity,
+            "active":item.active,
+            "bloomberg_security":item.bloomberg_security,
+        } for item in portfolio]
+        portfolio_html=(_opp_portfolio_table({"positions":entries})
+                        if entries else '<p>No Fortress portfolio positions available.</p>')
+        body+=f'''<div class="card"><h3>Fortress Portfolio</h3>
+<p class="muted">Upload-driven history. ACTIVE positions are in the latest published Exposure portfolio; positions no longer present are ARCHIVED, and past-expiry options are shown as EXPIRED. This is display/history only and does not change Delta calculations.</p>
+{portfolio_html}</div>'''
+        body+=f'''<div class="card"><h3>Fortress Daily Return Baseline — P&amp;L Upload</h3>
 <p>Upload the previous trading day's Nirvana <strong>PNL Report</strong> as PDF or Excel (XLSX). It supplies positions, quantities, previous marks and NAV for both Bloomberg and Yahoo Daily Return.</p>
 <form method="post" action="/admin/daily-return/upload" enctype="multipart/form-data"><input type="file" name="file" accept=".pdf,.xlsx,.xlsm,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button>Upload Fortress P&amp;L</button></form><br>{current}</div>'''
-    with SessionLocal() as db:
-        today=_ny_now().date().isoformat()
-        portfolio=db.query(Position).order_by(Position.ticker,Position.expiry,Position.strike).all()
-        prows=[]
-        for item in portfolio:
-            status=("EXPIRED" if str(item.expiry or "")<today else ("ACTIVE" if item.active else "ARCHIVED"))
-            sec=html.escape(str(item.bloomberg_security or ""))
-            prows.append(f'<tr><td>{html.escape(str(item.ticker))}</td><td>{html.escape(str(item.expiry))}</td><td>{html.escape(str(item.option_type))}</td><td>{float(item.strike):g}</td><td>{float(item.quantity):,.0f}</td><td>{status}</td><td>{sec}</td></tr>')
-        body+='''<div class="card"><h3>Fortress Portfolio</h3><p class="muted">Read-only Exposure portfolio. Positions come from the current Nirvana upload and database; EXPIRED / ARCHIVED are displayed for reference only. Intraday trades are managed below, not here.</p><div style="overflow-x:auto"><table><thead><tr><th>Ticker</th><th>Expiry</th><th>Type</th><th>Strike</th><th>Qty</th><th>Status</th><th>Bloomberg Security</th></tr></thead><tbody>{''.join(prows) or '<tr><td colspan="7">No portfolio positions.</td></tr>'}</tbody></table></div></div>'''
         body+=_intraday_panel(db,"fortress")
     return page("Fortress Setup",body,u)
 
