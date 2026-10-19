@@ -212,7 +212,8 @@ def _parse_pnl_upload(data:bytes,filename:str):
 
 COLLECTOR_TOKEN=os.getenv("COLLECTOR_TOKEN","")
 STALE_AFTER_SECONDS=max(int(os.getenv("STALE_AFTER_SECONDS","150")),150)
-app=FastAPI(title="RPD Fund Management v6.15.1 — Automatic Expiration",docs_url=None,redoc_url=None)
+RPD_FAVICON_BASE64="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"
+app=FastAPI(title="RPD Fund Management v6.15.4 — Navbar Online Users",docs_url=None,redoc_url=None)
 
 def init_data():
     ensure_admin()
@@ -250,6 +251,67 @@ def require_admin(request):
     if u["username"]!=ADMIN_USER or u["role"]!="admin":raise HTTPException(403,"Admin only")
     return u
 
+# v6.15.3: passive online user detection — no new polling, no new database table.
+# Browser page requests already authenticate; save a lightweight timestamp at most
+# once every three minutes per user, using the existing Setting table.
+_PRESENCE_WRITE_INTERVAL_SECONDS = 180
+_PRESENCE_ONLINE_WINDOW_SECONDS = 360
+_presence_last_write = {}
+
+def _presence_key(username):
+    return "web_user_presence:" + str(username).strip().lower()
+
+def _record_user_seen(username, force=False):
+    name = str(username or "").strip().lower()
+    if not name:
+        return
+    now = datetime.now(timezone.utc)
+    previous = _presence_last_write.get(name)
+    if not force and previous is not None and (now - previous).total_seconds() < _PRESENCE_WRITE_INTERVAL_SECONDS:
+        return
+    # Never interrupt a functioning dashboard merely because presence tracking
+    # failed (e.g. brief transient database connection problems).
+    try:
+        with SessionLocal() as db:
+            _set_json_setting(db, _presence_key(name), {"last_seen":now.isoformat(), "logged_out":False})
+            db.commit()
+        _presence_last_write[name] = now
+    except Exception:
+        pass
+
+def _record_user_offline(username):
+    name = str(username or "").strip().lower()
+    if not name:
+        return
+    _presence_last_write.pop(name, None)
+    try:
+        with SessionLocal() as db:
+            old = _json_setting(db, _presence_key(name), {})
+            seen = old.get("last_seen") if isinstance(old, dict) else None
+            _set_json_setting(db, _presence_key(name), {"last_seen":seen, "logged_out":True})
+            db.commit()
+    except Exception:
+        pass
+
+def _read_presence(db, username, active=True, now=None):
+    now = now or datetime.now(timezone.utc)
+    item = _json_setting(db, _presence_key(username), {})
+    if not isinstance(item, dict):
+        item = {}
+    ts = None
+    try:
+        raw = str(item.get("last_seen") or "")
+        if raw:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    age = max(0, (now - ts).total_seconds()) if ts is not None else None
+    online = bool(active and ts is not None and age <= _PRESENCE_ONLINE_WINDOW_SECONDS and not item.get("logged_out", False))
+    return {"online":online, "age_seconds":age, "timestamp":ts}
+
 def page(title,body,user=None,refresh=None):
     def nav_class(key):
         t=str(title or "").lower()
@@ -261,15 +323,35 @@ def page(title,body,user=None,refresh=None):
         elif key=="opp_bloomberg": active=(t=="opportunity bloomberg delta monitor")
         elif key=="opp_daily": active=(t=="opportunity bloomberg daily return")
         elif key=="opp_yahoo": active=(t=="opportunity yahoo daily return")
-        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
+        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
         return "active" if active else ""
 
-    admin_titles={"admin","fortress setup","opportunity setup","users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
+    if user:
+        _record_user_seen(user.get("username"))
+    admin_titles={"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
     is_admin_page=bool(user and user.get("username")==ADMIN_USER and str(title or "").lower() in admin_titles)
 
     if user:
         adminlink=(f'<a href="/admin/fortress" class="nav-short {nav_class("admin")}"><span class="nav-single">Admin</span></a>' if user["username"]==ADMIN_USER else "")
         display_user=html.escape(str(user["username"]).capitalize())
+        # Admin-only, on-demand hover panel beside the signed-in username.
+        # Presence status is fetched ONLY when the user opens the panel.
+        nav_presence=(
+            '<div class="nav-presence">'
+            '<button type="button" id="nav-presence-trigger" class="nav-presence-trigger" '
+            'aria-label="Online Users" aria-haspopup="dialog" aria-expanded="false" '
+            'aria-controls="nav-presence-panel">'
+            '<span class="nav-presence-dot" aria-hidden="true"></span>Online Users'
+            '<span class="nav-presence-chevron" aria-hidden="true">▾</span></button>'
+            '<div id="nav-presence-panel" class="nav-presence-panel" role="dialog" '
+            'aria-label="Online Users" hidden>'
+            '<div class="nav-presence-head"><strong>Online Users</strong>'
+            '<span id="nav-presence-count">—</span></div>'
+            '<div id="nav-presence-list" class="nav-presence-list" aria-live="polite">'
+            'Move your mouse here to see who is online.</div>'
+            '<a class="nav-presence-details" href="/admin/online-users">View full details →</a>'
+            '</div></div>'
+        ) if user.get("username")==ADMIN_USER and user.get("role")=="admin" else ""
         auth=(
             f'<a href="/overview" class="nav-two nav-overview {nav_class("overview")}"><span>Overview</span><strong aria-hidden="true">&nbsp;</strong></a>'
             f'<a href="/opportunity" class="nav-two {nav_class("opp_bloomberg")}"><span>Opportunity Bloomberg</span><strong>Delta</strong></a>'
@@ -278,7 +360,7 @@ def page(title,body,user=None,refresh=None):
             f'<a href="/" class="nav-two {nav_class("fortress_bloomberg")}"><span>Fortress Bloomberg</span><strong>Delta</strong></a>'
             f'<a href="/bloomberg-daily-return" class="nav-two {nav_class("fortress_daily")}"><span>Fortress Bloomberg</span><strong>Daily Return</strong></a>'
             f'<a href="/daily-return" class="nav-two {nav_class("fortress_yahoo")}"><span>Fortress Yahoo</span><strong>Daily Return</strong></a>'
-            f'{adminlink}<span class="nav-user">{display_user}</span><a href="/logout" class="nav-short"><span class="nav-single">Logout</span></a>'
+            f'{adminlink}<span class="nav-user">{display_user}</span>{nav_presence}<a href="/logout" class="nav-short"><span class="nav-single">Logout</span></a>' 
         )
     else:
         auth=""
@@ -299,13 +381,14 @@ def page(title,body,user=None,refresh=None):
           '<a href="/opportunity">Delta Positions</a><a href="/opportunity/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/opportunity/yahoo-daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group side-tools">'
           f'<a href="/admin/users" class="{sactive("users")}">User Management</a>'
+          f'<a href="/admin/online-users" class="{sactive("online users")}">Online Users</a>' 
           f'<a href="/admin/audit" class="{sactive("audit")}">Logs</a></div></aside>'
         )
 
     rf=f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     body_shell=(f'<div class="admin-layout">{admin_sidebar}<main class="admin-content">{body}</main></div>' if is_admin_page else body)
     return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">{rf}<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title><style>
+<title>RPD Delta &amp; Daily Return Monitor</title><link rel="icon" type="image/png" href="data:image/png;base64,{RPD_FAVICON_BASE64}"><style>
 *{{box-sizing:border-box}}html{{background:#f4f7fb}}body{{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f4f7fb;color:#15223a}}.wrap{{max-width:1780px;margin:auto;padding:24px 28px 42px}}
 .topbar{{background:#142b4d;color:#fff;box-shadow:0 2px 8px rgba(13,33,60,.18);position:relative;z-index:5}}.topinner{{max-width:1780px;margin:auto;padding:0 18px;display:flex;align-items:stretch;min-height:78px;gap:10px}}
 .brand-logo{{display:flex;align-items:center;justify-content:center;flex:0 0 auto;text-decoration:none;margin:8px 12px 8px 0;background:#fff;border-radius:11px;padding:4px 8px;border:1px solid rgba(255,255,255,.55);overflow:hidden}}.brand-logo img{{width:188px;height:auto;display:block}}
@@ -313,6 +396,27 @@ nav{{display:flex;align-items:stretch;gap:2px;min-width:0;flex:1;overflow-x:auto
 nav a{{color:#fff;text-decoration:none;border-bottom:3px solid transparent;transition:background .15s ease,border-color .15s ease,color .15s ease}}nav a:hover{{background:rgba(255,255,255,.075)}}nav a.active{{background:#1d4574;border-bottom-color:#9fc5f5}}
 .nav-two{{min-width:126px;padding:13px 8px 10px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;white-space:nowrap;line-height:1.08}}.nav-two span{{font-size:11.5px;font-weight:500}}.nav-two strong{{font-size:12.5px;margin-top:5px;font-weight:700}}
 .nav-short{{min-width:61px;padding:0 10px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;white-space:nowrap}}.nav-overview{{min-width:84px;padding-left:12px;padding-right:12px}}.nav-single{{display:block}}.nav-user{{min-width:52px;padding:0 9px;display:flex;align-items:center;justify-content:center;font-size:12px;color:#dce7f5;white-space:nowrap}}
+/* Only the admin Online Users menu is new. Top-clock CSS is untouched. */
+.nav-presence{{display:flex;align-items:stretch;flex:0 0 auto}}
+.nav-presence-trigger{{display:inline-flex;gap:6px;align-items:center;justify-content:center;padding:0 10px;border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;color:#fff;font-size:12px;font-weight:600;white-space:nowrap;min-width:98px}}
+.nav-presence-trigger:hover,.nav-presence-trigger:focus-visible{{background:rgba(255,255,255,.09)}}
+.nav-presence-dot{{width:7px;height:7px;border-radius:50%;background:#34c889;flex:0 0 auto}}
+.nav-presence-chevron{{font-size:10px;color:#bfd3eb;margin-left:2px}}
+.nav-presence-panel{{position:fixed;z-index:9999;width:min(280px,calc(100vw - 20px));max-height:min(390px,calc(100vh - 24px));overflow-y:auto;border:1px solid #dce4f1;border-radius:12px;background:#fff;color:#172a45;box-shadow:0 14px 38px rgba(10,30,54,.25);font-size:13px;padding:10px 12px}}
+.nav-presence-panel[hidden]{{display:none!important}}
+.nav-presence-head{{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e6ecf5;padding:4px 0 10px;margin-bottom:7px}}
+.nav-presence-head strong{{font-size:14px}}
+.nav-presence-head span{{background:#e6f8ef;border-radius:16px;padding:3px 9px;color:#08794d;font-size:12px;font-weight:750}}
+.nav-presence-list{{min-height:35px}}
+.nav-presence-row{{display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid #f0f3f8}}
+.nav-presence-row:last-child{{border-bottom:0}}
+.nav-presence-online-dot{{width:7px;height:7px;display:inline-block;background:#13a16a;border-radius:50%;flex:0 0 auto}}
+.nav-presence-name{{font-weight:650}}
+.nav-presence-role{{font-size:11px;color:#72819a;margin-left:auto}}
+.nav-presence-empty{{color:#75849a;padding:10px 2px}}
+.nav-presence-details{{display:block!important;border:0!important;padding:10px 3px 2px!important;text-decoration:none;color:#155997!important;text-align:right;font-size:12px;font-weight:700;min-height:0!important;width:auto!important}}
+.nav-presence-details:hover{{text-decoration:underline!important;background:transparent!important}}
+@media(max-width:760px){{.nav-presence{{width:100%;display:block}}.nav-presence-trigger{{width:100%;justify-content:center;min-height:44px;font-size:13px}}}}
 .top-clock{{display:flex;align-items:center;gap:9px;border-left:1px solid rgba(255,255,255,.22);padding-left:14px;margin:9px 34px 9px 4px;white-space:nowrap;flex:0 0 auto}}.top-clock-icon{{font-size:19px;line-height:1}}.top-clock-text{{display:flex;flex-direction:column;line-height:1.15}}.top-clock-label{{font-size:10.5px;color:#b9c8dc;font-weight:600}}.top-clock-value{{font-size:11.5px;color:#fff;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}}
 .card{{background:#fff;border:1px solid #dce4ef;border-radius:13px;padding:16px 18px;margin-bottom:14px;box-shadow:0 1px 2px rgba(15,39,70,.025)}}.grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:16px}}.grid>.card{{margin-bottom:0;min-height:115px}}
 .metric{{position:relative;overflow:hidden}}.metric:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:#d6e4f8}}.grid>.metric:nth-child(1){{background:linear-gradient(135deg,#f6fffb,#fff)}}.grid>.metric:nth-child(1):before{{background:#2aa66a}}.grid>.metric:nth-child(2){{background:linear-gradient(135deg,#fbf9ff,#fff)}}.grid>.metric:nth-child(2):before{{background:#7457d9}}.grid>.metric:nth-child(3){{background:linear-gradient(135deg,#fffafa,#fff)}}.grid>.metric:nth-child(3):before{{background:#e15f55}}.grid>.metric:nth-child(4){{background:linear-gradient(135deg,#f8fbff,#fff)}}.grid>.metric:nth-child(4):before{{background:#498ee7}}.grid>.metric:nth-child(5){{background:linear-gradient(135deg,#fffcf6,#fff)}}.grid>.metric:nth-child(5):before{{background:#e3a126}}
@@ -386,7 +490,59 @@ form[style*="display:flex"]{{align-items:center!important}}form[style*="display:
 </style></head><body>
 <div class="topbar"><div class="topinner"><a class="brand-logo" href="/overview"><img src="data:image/png;base64,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" alt="RPD Fund Management logo"></a><button type="button" class="mobile-nav-toggle" aria-expanded="false" aria-controls="primary-nav" aria-label="Open navigation"><span></span><span></span><span></span></button><nav id="primary-nav">{auth}</nav><div class="top-clock" aria-label="New York date and time"><div class="top-clock-icon">◷</div><div class="top-clock-text"><span class="top-clock-label">New York</span><span class="top-clock-value" id="global-ny-clock">Loading…</span></div></div></div></div>
 <div class="wrap">{body_shell}</div>
-<script>(function(){{const el=document.getElementById("global-ny-clock");if(el){{const fmt=new Intl.DateTimeFormat("en-US",{{timeZone:"America/New_York",weekday:"short",month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",second:"2-digit",hour12:true}});function tick(){{el.textContent=fmt.format(new Date());}}tick();setInterval(tick,1000);}}const btn=document.querySelector(".mobile-nav-toggle");const nav=document.getElementById("primary-nav");if(btn&&nav){{btn.addEventListener("click",function(){{const open=nav.classList.toggle("mobile-open");btn.setAttribute("aria-expanded",open?"true":"false");btn.setAttribute("aria-label",open?"Close navigation":"Open navigation");}});nav.querySelectorAll("a").forEach(function(a){{a.addEventListener("click",function(){{if(window.innerWidth<=760){{nav.classList.remove("mobile-open");btn.setAttribute("aria-expanded","false");}}}});}});}}}})();</script></body></html>""")
+<script>(function(){{const el=document.getElementById("global-ny-clock");if(el){{const fmt=new Intl.DateTimeFormat("en-US",{{timeZone:"America/New_York",weekday:"short",month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",second:"2-digit",hour12:true}});function tick(){{el.textContent=fmt.format(new Date());}}tick();setInterval(tick,1000);}}const btn=document.querySelector(".mobile-nav-toggle");const nav=document.getElementById("primary-nav");if(btn&&nav){{btn.addEventListener("click",function(){{const open=nav.classList.toggle("mobile-open");btn.setAttribute("aria-expanded",open?"true":"false");btn.setAttribute("aria-label",open?"Close navigation":"Open navigation");}});nav.querySelectorAll("a").forEach(function(a){{a.addEventListener("click",function(){{if(window.innerWidth<=760){{nav.classList.remove("mobile-open");btn.setAttribute("aria-expanded","false");}}}});}});}}}})();</script>
+<script>(function(){{
+    // No heartbeat and no timers that contact the server in the background:
+    // one small admin-protected request on deliberate hover/focus/click, cached for 30s.
+    const trigger=document.getElementById('nav-presence-trigger');
+    const panel=document.getElementById('nav-presence-panel');
+    if(!trigger||!panel)return;
+    const list=document.getElementById('nav-presence-list');
+    const count=document.getElementById('nav-presence-count');
+    let closeTimer=null,lastFetch=0,requestInFlight=false;
+    function closePanel(){{clearTimeout(closeTimer);panel.hidden=true;trigger.setAttribute('aria-expanded','false');}}
+    function closeSoon(){{clearTimeout(closeTimer);closeTimer=setTimeout(closePanel,220);}}
+    function renderUsers(payload){{
+        const users=Array.isArray(payload.users)?payload.users:[];
+        count.textContent=String(users.length)+' online';
+        list.replaceChildren();
+        if(!users.length){{const el=document.createElement('div');el.className='nav-presence-empty';el.textContent='No users currently online.';list.appendChild(el);return;}}
+        for(const user of users){{
+            const row=document.createElement('div');row.className='nav-presence-row';
+            const dot=document.createElement('span');dot.className='nav-presence-online-dot';
+            const name=document.createElement('span');name.className='nav-presence-name';name.textContent=user.username||'';
+            const role=document.createElement('span');role.className='nav-presence-role';role.textContent=user.role||'';
+            row.append(dot,name,role);list.appendChild(row);
+        }}
+    }}
+    function refreshOnDemand(){{
+        if(requestInFlight || Date.now()-lastFetch<30000)return;
+        lastFetch=Date.now();requestInFlight=true;
+        fetch('/admin/online-users/summary',{{credentials:'same-origin',cache:'no-store'}})
+            .then(r=>{{if(!r.ok)throw new Error('Could not load users');return r.json();}})
+            .then(renderUsers)
+            .catch(()=>{{list.textContent='Unable to load online users. Please try again.';lastFetch=0;}})
+            .finally(()=>{{requestInFlight=false;}});
+    }}
+    function showPanel(){{
+        clearTimeout(closeTimer);
+        panel.hidden=false;trigger.setAttribute('aria-expanded','true');
+        const rect=trigger.getBoundingClientRect();
+        const width=panel.offsetWidth;
+        panel.style.left=Math.max(10,Math.min(rect.left,window.innerWidth-width-10))+'px';
+        panel.style.top=Math.min(rect.bottom+8,window.innerHeight-panel.offsetHeight-10)+'px';
+        refreshOnDemand();
+    }}
+    trigger.addEventListener('mouseenter',showPanel);
+    trigger.addEventListener('mouseleave',closeSoon);
+    trigger.addEventListener('focus',showPanel);
+    trigger.addEventListener('click',showPanel);
+    panel.addEventListener('mouseenter',()=>clearTimeout(closeTimer));
+    panel.addEventListener('mouseleave',closeSoon);
+    document.addEventListener('pointerdown',e=>{{if(!panel.hidden&&!panel.contains(e.target)&&!trigger.contains(e.target))closePanel();}});
+    document.addEventListener('keydown',e=>{{if(e.key==='Escape')closePanel();}});
+    window.addEventListener('resize',()=>{{if(!panel.hidden)showPanel();}});
+}})();</script></body></html>""")
 
 def admin_tabs():
     return ''
@@ -407,11 +563,14 @@ def login_post(username:str=Form(...),password:str=Form(...)):
         if not u or not verify_password(password,u.password_hash):
             return page("Login failed",'<div class="card"><h2>Login failed</h2><a href="/login">Try again</a></div>')
         if name==ADMIN_USER:audit(db,name,"ADMIN_LOGIN","Admin signed in");db.commit()
+    _record_user_seen(name, force=True)
     resp=RedirectResponse("/",303);resp.set_cookie("session",sign_session(name),httponly=True,secure=True,samesite="strict",max_age=604800)
     return resp
 
 @app.get("/logout")
-def logout():
+def logout(request:Request):
+    name=read_session(request.cookies.get("session", ""))
+    if name: _record_user_offline(name)
     r=RedirectResponse("/login",303);r.delete_cookie("session");return r
 
 def latest_snapshot(db):
@@ -1939,6 +2098,143 @@ def export_report(request:Request,fund_key:str,report_key:str,fmt:str):
     return Response(content=data,media_type=media,headers={"Content-Disposition":f'attachment; filename="{filename}"'})
 
 
+# v6.15.2 - Bloomberg-only Strike Proximity Monitor.
+# This presentation helper consumes Collector v4.2 snapshots but never mutates
+# positions, exposure settings, expiration state, or daily-return prices.
+def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_of=None, age_seconds=None):
+    today=str(as_of or _ny_now().date().isoformat())
+    result={"rows":[], "all_rows":[], "missing":0, "total":0,
+            "message":"", "source_date":"", "state":"WAITING"}
+    if not isinstance(snapshot,dict):
+        result["message"]="Awaiting Bloomberg Collector snapshot."
+        return result
+    if str(snapshot.get("config_version")) != str(expected_version):
+        result["message"]="Awaiting Bloomberg sync for the current portfolio configuration."
+        return result
+    raw_ts=str(snapshot.get("timestamp_utc") or "")
+    try:
+        ts=datetime.fromisoformat(raw_ts.replace("Z","+00:00"))
+        if ts.tzinfo is None:raise ValueError("missing UTC offset")
+        result["source_date"]=ts.astimezone(ZoneInfo("America/New_York")).strftime("%d %b %Y, %I:%M %p NY")
+    except (ValueError,OverflowError):
+        result["message"]="Bloomberg snapshot timestamp unavailable."
+        return result
+    mode=str(snapshot.get("mode") or "LIVE")
+    if mode=="MARKET_CLOSED":
+        result["state"]="CLOSING SNAPSHOT"
+    elif age_seconds is not None and age_seconds>STALE_AFTER_SECONDS:
+        result["state"]="STALE DATA"
+    else:
+        result["state"]="LIVE"
+    accepted_sources={"OPT_UNDL_PX","UNDERLYING_BID_ASK_MID","UNDERLYING_PX_LAST"}
+    seen=set()
+    for row in snapshot.get("positions") or []:
+        if not isinstance(row,dict) or not row.get("use_for_delta"):continue
+        if str(row.get("instrument_type") or "OPTION").upper()!="OPTION":continue
+        ticker=str(row.get("ticker") or "").upper().strip()
+        typ=str(row.get("option_type") or "").upper().strip()[:1]
+        expiry=str(row.get("expiry") or "")
+        if not ticker or typ not in ("P","C") or not re.fullmatch(r"\d{4}-\d{2}-\d{2}",expiry) or expiry<today:
+            continue
+        try:
+            strike=float(row.get("strike"))
+            qty=float(row.get("quantity"))
+        except (TypeError,ValueError,OverflowError):continue
+        if not (math.isfinite(strike) and strike>0 and math.isfinite(qty) and qty!=0):continue
+        key=(ticker,expiry,typ,round(strike,6))
+        if key in seen:continue
+        seen.add(key)
+        result["total"]+=1
+        spot=None
+        try:spot=float(row.get("underlying_spot"))
+        except (TypeError,ValueError,OverflowError):pass
+        src=str(row.get("spot_source") or "")
+        if spot is None or not math.isfinite(spot) or spot<=0 or src not in accepted_sources:
+            result["missing"]+=1
+            # Missing Bloomberg price cannot be assumed far from strike.
+            result["all_rows"].append({"ticker":ticker,"type":typ,"expiry":expiry,
+                                       "qty":abs(qty),"strike":strike,"spot":None,
+                                       "distance":None,"source":src})
+            continue
+        # Signed distance: OTM positive; ITM negative for BOTH puts and calls.
+        distance_pct=100*((spot-strike) if typ=="P" else (strike-spot))/strike
+        item={"ticker":ticker,"type":typ,"expiry":expiry,"qty":abs(qty),
+              "strike":strike,"spot":spot,"distance":distance_pct,"source":src}
+        result["all_rows"].append(item)
+        if distance_pct<=10.0:result["rows"].append(item)
+    result["rows"].sort(key=lambda r:(r["distance"],r["ticker"],r["expiry"]))
+    result["all_rows"].sort(key=lambda r:(r["distance"] is None,float('inf') if r["distance"] is None else r["distance"],r["ticker"],r["expiry"]))
+    return result
+
+
+def _strike_row_html(row):
+    distance=row.get("distance")
+    if distance is None:
+        dist_html='<span class="strike-distance strike-missing">—</span>'
+    else:
+        klass="strike-itm" if distance<0 else ("strike-close" if distance<5 else ("strike-watch" if distance<=10 else "strike-far"))
+        dist_html=f'<span class="strike-distance {klass}">{distance:.2f}%</span>'
+    stock=('—' if row.get("spot") is None else f'${row["spot"]:,.2f}')
+    tooltip=html.escape(str(row.get("source") or "Bloomberg price unavailable"),quote=True)
+    return (f'<tr><td>{row["qty"]:,.0f}</td><td>{html.escape(row["ticker"])}</td>'
+            f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
+            f'<td>{html.escape(row["expiry"])}</td><td title="{tooltip}">{stock}</td><td>{dist_html}</td></tr>')
+
+
+def _strike_monitor_html(data, fund, *, full=False):
+    url=f'/strike-proximity/{fund}'
+    rows=data["all_rows"] if full else data["rows"]
+    warning=''
+    if data["message"]:
+        warning=f'<div class="strike-note">{html.escape(data["message"])}</div>'
+    else:
+        if data["state"]=="STALE DATA":
+            warning='<div class="strike-note strike-alert">Bloomberg data is stale. Values below are not live.</div>'
+        if data["missing"]:
+            warning+=f'<div class="strike-note strike-alert">Bloomberg underlying price unavailable for {data["missing"]} active option(s); these cannot be classified.</div>'
+    header=(f'<div class="panelhead"><div class="headgroup"><h3>Strike Proximity Monitor</h3>'
+            '<span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span>'
+            f'<span class="delay-badge bloomberg">Positions within 10% of strike: {len(data["rows"])}</span>'
+            '</div>'
+            +('' if full else f'<a href="{url}">Open full list →</a>')+'</div>')
+    meta=(f'<div class="strike-meta">Bloomberg only · {html.escape(data["state"])}'
+          +(f' · {html.escape(data["source_date"])}' if data["source_date"] else '')+'</div>')
+    message=('<tr><td colspan="7" class="strike-empty">'
+             +('Waiting for current Bloomberg data.' if data["message"] else
+               'No active options available.' if data["total"]==0 else
+               'No positions within 10% of strike or ITM.' if not full else
+               'No positions with a valid Bloomberg price.')+'</td></tr>')
+    tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
+         '<th>Qty</th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
+         +(''.join(_strike_row_html(r) for r in rows) if rows else message)
+         +'</tbody></table></div>')
+    return f'<div class="summarypanel strike-panel">{header}{meta}{warning}{tab}</div>'
+
+
+STRIKE_MONITOR_CSS="""
+.strike-panel{min-height:0;gap:0}
+.strike-panel .panelhead{margin-bottom:4px}
+.strike-meta{font-size:10.5px;color:#64748b;margin-bottom:6px}
+.strike-table-scroll{max-width:100%;overflow-x:auto}
+.strike-table{width:100%;min-width:635px;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.strike-table th,.strike-table td{padding:6px 8px;font-size:11.5px;white-space:nowrap;border-bottom:1px solid #e8edf4}
+.strike-table th{background:#f6f9fd;color:#182642;text-align:center;font-weight:700}
+.strike-table td{text-align:center}
+.strike-table th:nth-child(2),.strike-table td:nth-child(2){text-align:left;font-weight:650}
+.strike-table tr:last-child td{border-bottom:0}
+.strike-distance{display:inline-block;min-width:96px;border-radius:7px;padding:5px 9px;text-align:center;font-weight:750}
+.strike-distance.strike-watch{background:#fff0b3;color:#936000}
+.strike-distance.strike-close{background:#ffb36b;color:#883600}
+.strike-distance.strike-itm{background:#fca5a5;color:#991b1b}
+.strike-distance.strike-far{background:#edf2f9;color:#334155}
+.strike-distance.strike-missing{background:#f1f5f9;color:#475569}
+.strike-note{font-size:11px;color:#6b7280;margin:5px 0 7px}
+.strike-note.strike-alert{color:#9a3412}
+.strike-empty{text-align:center!important;color:#6b7280;font-weight:400!important;padding:13px!important}
+@media(max-width:760px){.strike-table{min-width:635px}.strike-panel .headgroup{gap:5px}}
+"""
+
 @app.get("/overview")
 def overview(request:Request):
     u=require_user(request)
@@ -1983,25 +2279,52 @@ def overview(request:Request):
         else:
             onav=0;oreport="—";oy_pnl=oy_ret=ob_pnl=ob_ret=0;oy_cov=ob_cov="0/0";oy_status=ob_status="NO BASELINE"
 
+        # Strike monitor is read-only. Collector Bloomberg underlying marks ONLY.
+        fstrike=_strike_proximity_data(fp,fcfg,age_seconds=fage)
+        ostrike=_strike_proximity_data(op,ocfg,age_seconds=oage)
+
     def cls(v): return "ok" if v>=0 else "bad"
     def limit_txt(x): return "—" if x is None else f"{x:.3f}%"
     def buffer_txt(x): return "—" if x is None else f"{x:+.3f}%"
-    def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov):
+    def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov,strike_data,fund_key):
         return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Delta Monitor</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
         <div class="mini"><span>Feed</span><b class="ok">{html.escape(dstatus)}</b><small>{html.escape(dsub)}</small></div><div class="mini"><span>Delta Exposure</span><b>{dpct:.3f}%</b><small>${dusd:,.0f}</small></div><div class="mini"><span>Limit</span><b>{limit_txt(limit)}</b></div><div class="mini"><span>Buffer</span><b class="{cls(buffer or 0) if buffer is not None else ''}">{buffer_txt(buffer)}</b></div><div class="mini"><span>Coverage</span><b>{dcov}</b><small>Collector v{collector} / Portal v{portalv}</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Daily Return</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{bd_status}</b><small>Bloomberg marks</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(bd_ret)}">{bd_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(bd_pnl)}">${bd_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{bd_cov}</b><small>Bloomberg marks</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
-        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div></section>'''
+        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key)}</section>'''
 
-    body=f'''<style>.funds{{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:stretch}}.fundcol{{min-width:0;display:grid;grid-template-rows:auto repeat(3,minmax(0,1fr));row-gap:14px;align-self:stretch}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#fff1c9;color:#805b00;border-color:#f6dda0}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}</style>
+    body=f'''<style>.funds{{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:stretch}}.fundcol{{min-width:0;display:grid;grid-template-rows:auto repeat(3,minmax(0,1fr)) auto;row-gap:14px;align-self:stretch}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
     <div class="funds">
-    {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov)}
-    {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov)}
+    {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov,ostrike,"opportunity")}
+    {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov,fstrike,"fortress")}
     </div>'''
 
     return page("Overview",body,u,60)
+
+
+@app.get("/strike-proximity/{fund}")
+def strike_proximity_full(request:Request,fund:str):
+    user=require_user(request)
+    if fund not in ("fortress","opportunity"):
+        raise HTTPException(404,"Unknown fund")
+    with SessionLocal() as db:
+        if fund=="fortress":
+            snapshot,age=latest_snapshot(db)
+            cfg=int(get_setting(db,"config_version","1"))
+        else:
+            snapshot,age=_latest_opportunity_snapshot(db)
+            cfg=int(get_setting(db,"opportunity_config_version","1") or 1)
+        data=_strike_proximity_data(snapshot,cfg,age_seconds=age)
+    title="RPD Fortress Fund" if fund=="fortress" else "RPD Opportunity Fund"
+    body=('<div style="margin-bottom:12px"><a href="/overview">← Back to Overview</a></div>'
+          f'<h1>{title} — Strike Proximity Monitor</h1>'
+          '<p class="muted">Bloomberg underlying prices only. Negative Out of Money means ITM; '
+          'these are monitoring estimates, not trade or assignment instructions.</p>'
+          f'<style>{STRIKE_MONITOR_CSS}.strike-table th,.strike-table td{{font-size:13px;padding:9px}}</style>'
+          +_strike_monitor_html(data,fund,full=True))
+    return page("Strike Proximity Monitor",body,user,60)
 
 
 def _delta_input_cell(value,source,kind="number"):
@@ -2292,6 +2615,56 @@ def pos_archive(request:Request,pid:int):
         if p.active:
             p.active=False;p.updated_at=utcnow();audit(db,u["username"],"POSITION_ARCHIVED",f"{p.ticker} {p.expiry} {p.option_type}{p.strike}");config_bump(db,u["username"],"Position archived");db.commit()
     return RedirectResponse("/admin",303)
+
+
+@app.get("/admin/online-users/summary")
+def online_users_summary(request:Request):
+    u=require_admin(request)
+    _record_user_seen(u["username"])
+    now=datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        people=db.query(User).order_by(User.username).all()
+        active=[{"username":person.username,"role":"Admin" if person.username==ADMIN_USER else "Viewer"}
+                for person in people if _read_presence(db,person.username,bool(person.active),now)["online"]]
+    return Response(content=json.dumps({"users":active},ensure_ascii=False),media_type="application/json",
+                    headers={"Cache-Control":"private, no-store"})
+
+@app.get("/admin/online-users")
+def online_users_page(request:Request):
+    u = require_admin(request)
+    # Record the admin visit before reading the table, so own status is current.
+    _record_user_seen(u["username"])
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        users = db.query(User).order_by(User.username).all()
+        online_count = 0
+        rows = []
+        for x in users:
+            state = _read_presence(db, x.username, bool(x.active), now)
+            if state["online"]:
+                online_count += 1
+            if state["timestamp"] is None:
+                last = "Never seen since this feature was enabled"
+            else:
+                last = state["timestamp"].astimezone(ZoneInfo("America/New_York")).strftime("%d %b %Y, %I:%M %p NY")
+                seconds = state["age_seconds"]
+                if seconds is not None and seconds < 60:
+                    last += " · just now"
+                elif seconds is not None and seconds < 3600:
+                    last += f" · {int(seconds // 60)} min ago"
+            role = "Admin" if x.username == ADMIN_USER else "Viewer"
+            status = '<span class="ok"><strong>● Online</strong></span>' if state["online"] else '<span class="muted">● Offline</span>'
+            if not x.active:
+                status = '<span class="muted">Disabled</span>'
+            rows.append(f'<tr><td>{html.escape(x.username)}</td><td>{role}</td><td>{status}</td><td>{html.escape(last)}</td></tr>')
+    table = "".join(rows)
+    body = (admin_tabs() + '<h1>Online Users</h1>'
+        + f'<div class="card"><h3>Currently Online: <span class="ok">{online_count}</span> &nbsp; | &nbsp; Total Users: {len(users)}</h3>'
+        + '<p class="muted">Online means the user has connected to an application page within the last 6 minutes. '
+        + 'The status uses existing page requests; no extra heartbeat or background polling runs. '
+        + 'A browser left open without loading pages may show Offline. Click Refresh in your browser for the latest view.</p></div>'
+        + f'<div class="card"><table><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last Activity (New York)</th></tr></thead><tbody>{table}</tbody></table></div>')
+    return page("Online Users", body, u)
 
 @app.get("/admin/users")
 def users_page(request:Request):
