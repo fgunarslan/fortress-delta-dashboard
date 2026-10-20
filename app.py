@@ -312,7 +312,7 @@ def _read_presence(db, username, active=True, now=None):
     online = bool(active and ts is not None and age <= _PRESENCE_ONLINE_WINDOW_SECONDS and not item.get("logged_out", False))
     return {"online":online, "age_seconds":age, "timestamp":ts}
 
-def page(title,body,user=None,refresh=None):
+def page(title,body,user=None,refresh=None,admin_pdf_fund=None):
     def nav_class(key):
         t=str(title or "").lower()
         active=False
@@ -375,11 +375,11 @@ def page(title,body,user=None,refresh=None):
           '<a class="side-main" href="/overview">Dashboard / Overview</a>'
           '<div class="side-group"><div class="side-group-title">Fortress Fund</div>'
           f'<a href="/admin/fortress" class="{sactive("fortress setup","nirvana import","nirvana import preview","map import","import preview","daily return upload")}">PNL / Exposure Upload</a>'
-          f'<a href="/admin/fortress/exposure-pdf" class="{sactive("exposure pdf upload") if "fortress" in request.url.path else ""}">Exposure Upload (PDF)</a>'
+          f'<a href="/admin/fortress/exposure-pdf" class="{sactive("exposure pdf upload") if admin_pdf_fund=="fortress" else ""}">Exposure Upload (PDF)</a>'
           '<a href="/">Delta Positions</a><a href="/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group"><div class="side-group-title">Opportunity Fund</div>'
           f'<a href="/admin/opportunity" class="{sactive("opportunity setup")}">PNL / Exposure Upload</a>'
-          f'<a href="/admin/opportunity/exposure-pdf" class="{sactive("exposure pdf upload") if "opportunity" in request.url.path else ""}">Exposure Upload (PDF)</a>'
+          f'<a href="/admin/opportunity/exposure-pdf" class="{sactive("exposure pdf upload") if admin_pdf_fund=="opportunity" else ""}">Exposure Upload (PDF)</a>'
           '<a href="/opportunity">Delta Positions</a><a href="/opportunity/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/opportunity/yahoo-daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group side-tools">'
           f'<a href="/admin/users" class="{sactive("users")}">User Management</a>'
@@ -2651,7 +2651,7 @@ This adds <strong>non-live Exposure %</strong> values only to the Strike Proximi
 <input type="file" name="file" accept=".pdf,application/pdf" required>
 <button type="submit">Upload {label} Exposure PDF</button></form><br>
 {history}<p class="muted">Matching uses ticker, expiration, Put/Call and strike. If no matching contract exists in the PDF, the Exposure column displays —. The newest uploaded report replaces the earlier Non-Live Exposure snapshot for this fund only.</p></div>'''
-    return page("Exposure PDF Upload",body,user)
+    return page("Exposure PDF Upload",body,user,admin_pdf_fund=fund)
 
 
 @app.post("/admin/{fund}/exposure-pdf")
