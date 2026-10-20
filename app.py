@@ -323,12 +323,12 @@ def page(title,body,user=None,refresh=None):
         elif key=="opp_bloomberg": active=(t=="opportunity bloomberg delta monitor")
         elif key=="opp_daily": active=(t=="opportunity bloomberg daily return")
         elif key=="opp_yahoo": active=(t=="opportunity yahoo daily return")
-        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
+        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload","exposure pdf upload"}
         return "active" if active else ""
 
     if user:
         _record_user_seen(user.get("username"))
-    admin_titles={"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload"}
+    admin_titles={"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload","exposure pdf upload"}
     is_admin_page=bool(user and user.get("username")==ADMIN_USER and str(title or "").lower() in admin_titles)
 
     if user:
@@ -375,9 +375,11 @@ def page(title,body,user=None,refresh=None):
           '<a class="side-main" href="/overview">Dashboard / Overview</a>'
           '<div class="side-group"><div class="side-group-title">Fortress Fund</div>'
           f'<a href="/admin/fortress" class="{sactive("fortress setup","nirvana import","nirvana import preview","map import","import preview","daily return upload")}">PNL / Exposure Upload</a>'
+          f'<a href="/admin/fortress/exposure-pdf" class="{sactive("exposure pdf upload") if "fortress" in request.url.path else ""}">Exposure Upload (PDF)</a>'
           '<a href="/">Delta Positions</a><a href="/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group"><div class="side-group-title">Opportunity Fund</div>'
           f'<a href="/admin/opportunity" class="{sactive("opportunity setup")}">PNL / Exposure Upload</a>'
+          f'<a href="/admin/opportunity/exposure-pdf" class="{sactive("exposure pdf upload") if "opportunity" in request.url.path else ""}">Exposure Upload (PDF)</a>'
           '<a href="/opportunity">Delta Positions</a><a href="/opportunity/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/opportunity/yahoo-daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group side-tools">'
           f'<a href="/admin/users" class="{sactive("users")}">User Management</a>'
@@ -2098,6 +2100,104 @@ def export_report(request:Request,fund_key:str,report_key:str,fmt:str):
     return Response(content=data,media_type=media,headers={"Content-Disposition":f'attachment; filename="{filename}"'})
 
 
+# v6.15.6 — Separate Nirvana PDF Exposure % display for Strike Proximity only.
+# Stored in an existing Setting record per fund, independent of Nirvana XLSX exposure,
+# collector config, portfolio quantities, NAV, Daily Return and expiration rules.
+STRIKE_PDF_EXPOSURE_PREFIX="strike_pdf_exposure_"
+STRIKE_PDF_EXPOSURE_PATTERN=re.compile(
+    r"(?<![A-Z0-9.\-])(?P<ticker>[A-Z][A-Z0-9.\-]*)\s+"
+    r"(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{2,4})\s+"
+    r"(?P<strike>\d+(?:\.\d+)?)\s+(?P<option_type>PUT|CALL)\s+"
+    r"(?P<exposure>-?\d+(?:\.\d+)?)\s*%",
+    re.IGNORECASE,
+)
+
+
+def _strike_pdf_option_key(ticker, expiry, option_type, strike):
+    """Stable, unambiguous identity. Never fall back to ticker-only matching."""
+    try:
+        return _opp_position_identity({"instrument_type":"OPTION",
+            "ticker":str(ticker).upper().strip(),"expiry":str(expiry),
+            "option_type":str(option_type).upper()[:1],"strike":float(strike)})
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def _parse_nirvana_strike_pdf_exposure(data:bytes, expected_fund:str, filename:str):
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("The uploaded file is not a valid PDF.")
+    if not 0 < len(data) <= 12 * 1024 * 1024:
+        raise ValueError("PDF exceeds the 12 MB upload limit.")
+    try:
+        reader=PdfReader(BytesIO(data))
+        if not reader.pages or len(reader.pages)>20:
+            raise ValueError("Unexpected PDF page count.")
+        parts=[]
+        for pdf_page in reader.pages:
+            try:
+                content=pdf_page.extract_text(extraction_mode="layout") or ""
+            except TypeError:
+                content=pdf_page.extract_text() or ""
+            if not content.strip():
+                content=pdf_page.extract_text() or ""
+            parts.append(content)
+        first=parts[0]
+        all_text="\n".join(parts)
+    except Exception as exc:
+        raise ValueError("Could not read text from Nirvana PDF.") from exc
+    if "exposure summary" not in first.lower():
+        raise ValueError("Expected a Nirvana Exposure Summary PDF.")
+    correct_name="Fortress Fund" if expected_fund=="fortress" else "Opportunity Fund"
+    if not re.search(re.escape(correct_name), first, re.IGNORECASE):
+        raise ValueError("PDF does not match the selected fund: " + correct_name)
+    date_match=re.search(r"Report\s+Date\s*:\s*(\d{1,2}/\d{1,2}/\d{4})",first,re.I)
+    if date_match is None:
+        raise ValueError("Report Date not found in the PDF.")
+    try:
+        report_date=datetime.strptime(date_match.group(1),"%m/%d/%Y").date().isoformat()
+    except ValueError as exc:
+        raise ValueError("Invalid Report Date in PDF.") from exc
+
+    found={}
+    for match in STRIKE_PDF_EXPOSURE_PATTERN.finditer(all_text):
+        g=match.groupdict()
+        yy=int(g["year"])
+        if yy<100: yy+=2000
+        try:
+            expiration=date(yy,int(g["month"]),int(g["day"])).isoformat()
+            value=float(g["exposure"])
+            if not math.isfinite(value):raise ValueError()
+        except (ValueError,OverflowError) as exc:
+            raise ValueError("Invalid option contract/Exposure percentage in PDF.") from exc
+        key=_strike_pdf_option_key(g["ticker"],expiration,g["option_type"],g["strike"])
+        if key in found:
+            raise ValueError("Duplicate option exposure in PDF: " + key)
+        found[key]=round(value,6)
+    if not found:
+        raise ValueError("No per-option exposure values found in the PDF. Nothing was saved.")
+    return {"report_date":report_date,"filename":str(filename or "Exposure.pdf"),
+            "uploaded_at":datetime.now(timezone.utc).isoformat(),
+            "positions":found,"count":len(found)}
+
+
+def _get_strike_pdf_exposure(db, fund):
+    val=_json_setting(db,STRIKE_PDF_EXPOSURE_PREFIX + fund,{})
+    return val if isinstance(val,dict) else {}
+
+
+def _strike_pdf_exposure_info(report, row):
+    positions=report.get("positions") if isinstance(report,dict) else None
+    if not isinstance(positions,dict):return None
+    key=_strike_pdf_option_key(row.get("ticker"),row.get("expiry"),row.get("type"),row.get("strike"))
+    val=positions.get(key)
+    if val is None:return None
+    try:
+        percent=float(val)
+        return percent if math.isfinite(percent) else None
+    except (TypeError,ValueError,OverflowError):
+        return None
+
+
 # v6.15.2 - Bloomberg-only Strike Proximity Monitor.
 # This presentation helper consumes Collector v4.2 snapshots but never mutates
 # positions, exposure settings, expiration state, or daily-return prices.
@@ -2167,7 +2267,7 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
     return result
 
 
-def _strike_row_html(row):
+def _strike_row_html(row, exposure_report=None):
     distance=row.get("distance")
     if distance is None:
         dist_html='<span class="strike-distance strike-missing">—</span>'
@@ -2176,12 +2276,15 @@ def _strike_row_html(row):
         dist_html=f'<span class="strike-distance {klass}">{distance:.2f}%</span>'
     stock=('—' if row.get("spot") is None else f'${row["spot"]:,.2f}')
     tooltip=html.escape(str(row.get("source") or "Bloomberg price unavailable"),quote=True)
-    return (f'<tr><td>{row["qty"]:,.0f}</td><td>{html.escape(row["ticker"])}</td>'
+    exposure=_strike_pdf_exposure_info(exposure_report,row)
+    pdf_date=html.escape(str((exposure_report or {}).get("report_date") or "No Nirvana PDF uploaded"),quote=True)
+    exposure_label=("—" if exposure is None else f"{exposure:.2f}%")
+    return (f'<tr><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
             f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
             f'<td>{html.escape(row["expiry"])}</td><td title="{tooltip}">{stock}</td><td>{dist_html}</td></tr>')
 
 
-def _strike_monitor_html(data, fund, *, full=False):
+def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
     url=f'/strike-proximity/{fund}'
     rows=data["all_rows"] if full else data["rows"]
     warning=''
@@ -2199,15 +2302,15 @@ def _strike_monitor_html(data, fund, *, full=False):
             +('' if full else f'<a href="{url}">Open full list →</a>')+'</div>')
     meta=(f'<div class="strike-meta">Bloomberg only · {html.escape(data["state"])}'
           +(f' · {html.escape(data["source_date"])}' if data["source_date"] else '')+'</div>')
-    message=('<tr><td colspan="7" class="strike-empty">'
+    message=('<tr><td colspan="8" class="strike-empty">'
              +('Waiting for current Bloomberg data.' if data["message"] else
                'No active options available.' if data["total"]==0 else
                'No positions within 10% of strike or ITM.' if not full else
                'No positions with a valid Bloomberg price.')+'</td></tr>')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
-         '<th>Qty</th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
-         +(''.join(_strike_row_html(r) for r in rows) if rows else message)
+         +(''.join(_strike_row_html(r,exposure_report) for r in rows) if rows else message)
          +'</tbody></table></div>')
     return f'<div class="summarypanel strike-panel">{header}{meta}{warning}{tab}</div>'
 
@@ -2217,11 +2320,12 @@ STRIKE_MONITOR_CSS="""
 .strike-panel .panelhead{margin-bottom:4px}
 .strike-meta{font-size:10.5px;color:#64748b;margin-bottom:6px}
 .strike-table-scroll{max-width:100%;overflow-x:auto}
-.strike-table{width:100%;min-width:635px;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.strike-table{width:100%;min-width:720px;border-collapse:collapse;font-variant-numeric:tabular-nums}
 .strike-table th,.strike-table td{padding:6px 8px;font-size:11.5px;white-space:nowrap;border-bottom:1px solid #e8edf4}
 .strike-table th{background:#f6f9fd;color:#182642;text-align:center;font-weight:700}
 .strike-table td{text-align:center}
-.strike-table th:nth-child(2),.strike-table td:nth-child(2){text-align:left;font-weight:650}
+.strike-table th:nth-child(3),.strike-table td:nth-child(3){text-align:left;font-weight:650}
+.strike-exposure-info{cursor:help;text-decoration:none;border:0;font-size:11px;color:#4c648b;font-weight:600}
 .strike-table tr:last-child td{border-bottom:0}
 .strike-distance{display:inline-block;min-width:96px;border-radius:7px;padding:5px 9px;text-align:center;font-weight:750}
 .strike-distance.strike-watch{background:#fff0b3;color:#936000}
@@ -2232,7 +2336,7 @@ STRIKE_MONITOR_CSS="""
 .strike-note{font-size:11px;color:#6b7280;margin:5px 0 7px}
 .strike-note.strike-alert{color:#9a3412}
 .strike-empty{text-align:center!important;color:#6b7280;font-weight:400!important;padding:13px!important}
-@media(max-width:760px){.strike-table{min-width:635px}.strike-panel .headgroup{gap:5px}}
+@media(max-width:760px){.strike-table{min-width:720px}.strike-panel .headgroup{gap:5px}}
 """
 
 @app.get("/overview")
@@ -2282,23 +2386,25 @@ def overview(request:Request):
         # Strike monitor is read-only. Collector Bloomberg underlying marks ONLY.
         fstrike=_strike_proximity_data(fp,fcfg,age_seconds=fage)
         ostrike=_strike_proximity_data(op,ocfg,age_seconds=oage)
+        f_pdf_exposure=_get_strike_pdf_exposure(db,"fortress")
+        o_pdf_exposure=_get_strike_pdf_exposure(db,"opportunity")
 
     def cls(v): return "ok" if v>=0 else "bad"
     def limit_txt(x): return "—" if x is None else f"{x:.3f}%"
     def buffer_txt(x): return "—" if x is None else f"{x:+.3f}%"
-    def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov,strike_data,fund_key):
+    def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov,strike_data,fund_key,pdf_exposure):
         return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Delta Monitor</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
         <div class="mini"><span>Feed</span><b class="ok">{html.escape(dstatus)}</b><small>{html.escape(dsub)}</small></div><div class="mini"><span>Delta Exposure</span><b>{dpct:.3f}%</b><small>${dusd:,.0f}</small></div><div class="mini"><span>Limit</span><b>{limit_txt(limit)}</b></div><div class="mini"><span>Buffer</span><b class="{cls(buffer or 0) if buffer is not None else ''}">{buffer_txt(buffer)}</b></div><div class="mini"><span>Coverage</span><b>{dcov}</b><small>Collector v{collector} / Portal v{portalv}</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Daily Return</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{bd_status}</b><small>Bloomberg marks</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(bd_ret)}">{bd_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(bd_pnl)}">${bd_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{bd_cov}</b><small>Bloomberg marks</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
-        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key)}</section>'''
+        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key,exposure_report=pdf_exposure)}</section>'''
 
     body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
     <div class="funds">
-    {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov,ostrike,"opportunity")}
-    {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov,fstrike,"fortress")}
+    {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov,ostrike,"opportunity",o_pdf_exposure)}
+    {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov,fstrike,"fortress",f_pdf_exposure)}
     </div>'''
 
     return page("Overview",body,u,60)
@@ -2317,13 +2423,14 @@ def strike_proximity_full(request:Request,fund:str):
             snapshot,age=_latest_opportunity_snapshot(db)
             cfg=int(get_setting(db,"opportunity_config_version","1") or 1)
         data=_strike_proximity_data(snapshot,cfg,age_seconds=age)
+        pdf_exposure=_get_strike_pdf_exposure(db,fund)
     title="RPD Fortress Fund" if fund=="fortress" else "RPD Opportunity Fund"
     body=('<div style="margin-bottom:12px"><a href="/overview">← Back to Overview</a></div>'
           f'<h1>{title} — Strike Proximity Monitor</h1>'
           '<p class="muted">Bloomberg underlying prices only. Negative Out of Money means ITM; '
           'these are monitoring estimates, not trade or assignment instructions.</p>'
           f'<style>{STRIKE_MONITOR_CSS}.strike-table th,.strike-table td{{font-size:13px;padding:9px}}</style>'
-          +_strike_monitor_html(data,fund,full=True))
+          +_strike_monitor_html(data,fund,full=True,exposure_report=pdf_exposure))
     return page("Strike Proximity Monitor",body,user,60)
 
 
@@ -2523,6 +2630,54 @@ async def opportunity_manual_price(request:Request):
         if not found: raise HTTPException(404,"Position not found.")
         _set_json_setting(db,"opportunity_daily_baseline",b);audit(db,u["username"],"OPPORTUNITY_MANUAL_PRICE",f"{source} position_id={pid}; price={val}");db.commit()
     return RedirectResponse(redirect,303)
+
+@app.get("/admin/{fund}/exposure-pdf")
+def admin_strike_pdf_upload_page(request:Request,fund:str):
+    user=require_admin(request)
+    if fund not in ("fortress","opportunity"):
+        raise HTTPException(404,"Unknown fund")
+    label="Fortress" if fund=="fortress" else "Opportunity"
+    with SessionLocal() as db:
+        info=_get_strike_pdf_exposure(db,fund)
+    if info:
+        history=f'<div class="notice"><strong>Current Non-Live Exposure:</strong> {html.escape(str(info.get("filename") or ""))} · Report {html.escape(str(info.get("report_date") or ""))} · {len(info.get("positions") or {})} option(s) matched by full contract identity</div>'
+    else:
+        history='<p class="muted">No Exposure Summary PDF uploaded yet; Strike Proximity will show — until a matching PDF is provided.</p>'
+    body=admin_tabs()+f'''<h1>{label} — Exposure Upload</h1>
+<div class="card"><h3>Exposure Upload (PDF)</h3>
+<p>Upload the previous close Nirvana <strong>Exposure Summary</strong> PDF for {label} Fund.
+This adds <strong>non-live Exposure %</strong> values only to the Strike Proximity Monitor; it does not update the existing Exposure XLSX, NAV, positions, Delta or Daily Return.</p>
+<form method="post" action="/admin/{fund}/exposure-pdf" enctype="multipart/form-data">
+<input type="file" name="file" accept=".pdf,application/pdf" required>
+<button type="submit">Upload {label} Exposure PDF</button></form><br>
+{history}<p class="muted">Matching uses ticker, expiration, Put/Call and strike. If no matching contract exists in the PDF, the Exposure column displays —. The newest uploaded report replaces the earlier Non-Live Exposure snapshot for this fund only.</p></div>'''
+    return page("Exposure PDF Upload",body,user)
+
+
+@app.post("/admin/{fund}/exposure-pdf")
+async def admin_strike_pdf_upload_save(request:Request,fund:str,file:UploadFile=File(...)):
+    user=require_admin(request)
+    if fund not in ("fortress","opportunity"):
+        raise HTTPException(404,"Unknown fund")
+    filename=str(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(400,"Please upload a Nirvana Exposure Summary PDF.")
+    data=await file.read(12*1024*1024+1)
+    try:
+        report=_parse_nirvana_strike_pdf_exposure(data,fund,filename)
+    except ValueError as exc:
+        raise HTTPException(400,detail=str(exc))
+    with SessionLocal() as db:
+        previous=_get_strike_pdf_exposure(db,fund)
+        old_date=str(previous.get("report_date") or "")
+        if old_date and report["report_date"]<old_date:
+            raise HTTPException(400,"Older Exposure PDF not applied. Current report date is " + old_date)
+        _set_json_setting(db,STRIKE_PDF_EXPOSURE_PREFIX+fund,report)
+        audit(db,user["username"],"STRIKE_PDF_EXPOSURE_UPLOAD",
+              f'fund={fund};report={report["report_date"]};options={report["count"]}')
+        db.commit()
+    return RedirectResponse(f"/admin/{fund}/exposure-pdf",303)
+
 
 @app.get("/admin")
 def admin_home(request:Request):
