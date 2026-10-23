@@ -1,5 +1,6 @@
 from __future__ import annotations
-import os,json,hmac,html,uuid,re,math
+import os,json,hmac,html,uuid,re,math,threading,time
+from urllib.request import Request as UrlRequest, urlopen
 from datetime import datetime,timezone,date
 from zoneinfo import ZoneInfo
 from urllib.parse import quote,unquote
@@ -2339,6 +2340,119 @@ STRIKE_MONITOR_CSS="""
 @media(max-width:760px){.strike-table{min-width:720px}.strike-panel .headgroup{gap:5px}}
 """
 
+# -----------------------------------------------------------------------------
+# v6.15.6.2: Read-only Yahoo Finance ^VIX indicator for the Opportunity title.
+# No background worker, database writes, collector changes, or dependencies.
+# Yahoo/Cboe quote may be delayed; cache each external response across viewers.
+# -----------------------------------------------------------------------------
+_VIX_YAHOO_URLS=(
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?range=1d&interval=1m",
+    "https://query2.finance.yahoo.com/v8/finance/chart/%5EVIX?range=1d&interval=1m",
+)
+_VIX_CACHE_LOCK=threading.Lock()
+_VIX_CACHE={"next_check":0.0,"last_good":None}
+
+
+def _yahoo_vix_from_chart(document):
+    """Parse public Yahoo chart response; never invent missing quote/previous close."""
+    chart=(document or {}).get("chart") or {}
+    if chart.get("error"):
+        raise ValueError("Yahoo quote is unavailable")
+    data=chart.get("result") or []
+    if not data or not isinstance(data[0],dict):
+        raise ValueError("Yahoo quote missing")
+    item=data[0]
+    meta=item.get("meta") or {}
+    if meta.get("symbol") and str(meta["symbol"]).upper()!="^VIX":
+        raise ValueError("Unexpected Yahoo symbol")
+    price=meta.get("regularMarketPrice")
+    if price is None:
+        q=((item.get("indicators") or {}).get("quote") or [])
+        closes=(q[0].get("close") or []) if q else []
+        price=next((x for x in reversed(closes) if x is not None),None)
+    try: price=float(price)
+    except (ValueError,TypeError,OverflowError): raise ValueError("VIX price missing")
+    if not math.isfinite(price) or price<=0:
+        raise ValueError("Invalid VIX price")
+    previous=None
+    for key in ("regularMarketPreviousClose","previousClose","chartPreviousClose"):
+        if meta.get(key) is not None:
+            try:
+                n=float(meta[key])
+                if math.isfinite(n) and n>0:
+                    previous=n
+                    break
+            except (ValueError,TypeError,OverflowError): pass
+    stamp=meta.get("regularMarketTime")
+    if stamp is None:
+        raw=item.get("timestamp") or []
+        stamp=raw[-1] if raw else None
+    quote_time=None
+    if stamp is not None:
+        try:
+            quote_time=datetime.fromtimestamp(int(stamp),timezone.utc).astimezone(
+                ZoneInfo("America/New_York")).strftime("%d %b %Y, %I:%M %p NY")
+        except (OverflowError,OSError,TypeError,ValueError): pass
+    delta=(price-previous) if previous is not None else None
+    pct=(100.0*delta/previous) if delta is not None else None
+    return {"ok":True,"symbol":"^VIX","price":round(price,4),
+            "change":round(delta,4) if delta is not None else None,
+            "change_pct":round(pct,4) if pct is not None else None,
+            "quote_time_ny":quote_time,"stale":False,
+            "source":"Yahoo Finance · Cboe Indices (typically 15-min delayed)"}
+
+
+def _load_yahoo_vix():
+    headers={"User-Agent":"Mozilla/5.0 (compatible; RPD-VIX-Display/1.0)",
+             "Accept":"application/json","Cache-Control":"no-cache"}
+    last_error=None
+    for url in _VIX_YAHOO_URLS:
+        try:
+            req=UrlRequest(url,headers=headers)
+            with urlopen(req,timeout=3) as response:
+                body=response.read(512_000)
+            return _yahoo_vix_from_chart(json.loads(body))
+        except Exception as exc:
+            last_error=exc
+    raise RuntimeError("Yahoo VIX source unavailable") from last_error
+
+
+def _cached_yahoo_vix():
+    # Small in-process TTL. No persistent storage or periodic background polling.
+    now=time.monotonic()
+    with _VIX_CACHE_LOCK:
+        if now<_VIX_CACHE["next_check"]:
+            old=_VIX_CACHE["last_good"]
+            return dict(old) if old else {"ok":False,"error":"Yahoo VIX quote unavailable"}
+        try:
+            result=_load_yahoo_vix()
+            _VIX_CACHE["last_good"]=result
+            _VIX_CACHE["next_check"]=time.monotonic()+300  # 5 min query interval
+            return dict(result)
+        except Exception:
+            _VIX_CACHE["next_check"]=time.monotonic()+180  # avoid retry storms
+            old=_VIX_CACHE["last_good"]
+            if old:
+                return {**old,"stale":True}
+            return {"ok":False,"error":"Yahoo VIX quote unavailable"}
+
+
+@app.get("/api/market/vix")
+def market_vix_quote(request:Request):
+    require_user(request)
+    return _cached_yahoo_vix()
+
+
+VIX_OVERVIEW_BADGE=(
+    '<div class="rpd-vix" id="rpd-vix" '
+    'title="Yahoo Finance VIX (^VIX) · 15-min delayed quote">'
+    '<span class="rpd-vix-label">VIX</span>'
+    '<strong class="rpd-vix-price" id="rpd-vix-price">—</strong>'
+    '<span class="rpd-vix-change" id="rpd-vix-change">Yahoo Finance</span>'
+    '<span class="rpd-vix-delay">◷ 15-min delayed</span>'
+    '</div>'
+)
+
 @app.get("/overview")
 def overview(request:Request):
     u=require_user(request)
@@ -2393,7 +2507,7 @@ def overview(request:Request):
     def limit_txt(x): return "—" if x is None else f"{x:.3f}%"
     def buffer_txt(x): return "—" if x is None else f"{x:+.3f}%"
     def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov,strike_data,fund_key,pdf_exposure):
-        return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2></div>
+        return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2>{VIX_OVERVIEW_BADGE if accent=="opportunity" else ""}</div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Delta Monitor</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
         <div class="mini"><span>Feed</span><b class="ok">{html.escape(dstatus)}</b><small>{html.escape(dsub)}</small></div><div class="mini"><span>Delta Exposure</span><b>{dpct:.3f}%</b><small>${dusd:,.0f}</small></div><div class="mini"><span>Limit</span><b>{limit_txt(limit)}</b></div><div class="mini"><span>Buffer</span><b class="{cls(buffer or 0) if buffer is not None else ''}">{buffer_txt(buffer)}</b></div><div class="mini"><span>Coverage</span><b>{dcov}</b><small>Collector v{collector} / Portal v{portalv}</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Daily Return</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
@@ -2401,11 +2515,33 @@ def overview(request:Request):
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key,exposure_report=pdf_exposure)}</section>'''
 
-    body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
+    body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}.rpd-vix{{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums;white-space:nowrap}}.rpd-vix-label{{font-size:12.5px;font-weight:700;letter-spacing:.2px;color:#475569}}.rpd-vix-price{{font-size:19px;font-weight:800;color:#17233a}}.rpd-vix-change{{font-size:12px;font-weight:750;color:#63728b}}.rpd-vix-change.is-up{{color:#087a4b}}.rpd-vix-change.is-down{{color:#c22a20}}.rpd-vix-delay{{background:#eef3fb;border:1px solid #dde7f5;color:#2d4771;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:650}}@media(max-width:800px){{.rpd-vix{{gap:5px}}.rpd-vix-delay{{font-size:9px}}.rpd-vix-price{{font-size:17px}}}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
     <div class="funds">
     {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov,ostrike,"opportunity",o_pdf_exposure)}
     {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov,fstrike,"fortress",f_pdf_exposure)}
-    </div>'''
+    </div>
+    <script>(function(){{
+      const root=document.getElementById('rpd-vix');
+      if(!root)return;
+      const value=document.getElementById('rpd-vix-price');
+      const change=document.getElementById('rpd-vix-change');
+      fetch('/api/market/vix',{{credentials:'same-origin',cache:'no-store'}})
+        .then(r=>{{if(!r.ok)throw new Error('VIX unavailable');return r.json();}})
+        .then(data=>{{
+          if(!data.ok || !Number.isFinite(Number(data.price)))throw new Error('VIX unavailable');
+          value.textContent=Number(data.price).toFixed(2);
+          change.classList.remove('is-up','is-down');
+          const c=Number(data.change),p=Number(data.change_pct);
+          if(data.change!==null && data.change_pct!==null && Number.isFinite(c) && Number.isFinite(p)){{
+            change.textContent=(c>=0?'+':'')+c.toFixed(2)+' ('+(p>=0?'+':'')+p.toFixed(2)+'%)';
+            change.classList.add(c>0?'is-up':c<0?'is-down':'');
+          }}else{{change.textContent='Change unavailable';}}
+          if(data.stale)change.textContent+=' · STALE';
+          root.title='Yahoo Finance · delayed VIX quote'+(data.quote_time_ny?' · '+data.quote_time_ny:'')+(data.stale?' · Stale cache':'');
+        }})
+        .catch(()=>{{value.textContent='—';change.textContent='Unavailable';}});
+    }})();</script>
+'''
 
     return page("Overview",body,u,60)
 
