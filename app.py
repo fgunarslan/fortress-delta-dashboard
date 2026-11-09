@@ -1,7 +1,7 @@
 from __future__ import annotations
-import os,json,hmac,html,uuid,re,math,threading,time
+import os,json,hmac,html,uuid,re,math,threading,time,calendar
 from urllib.request import Request as UrlRequest, urlopen
-from datetime import datetime,timezone,date
+from datetime import datetime,timezone,date,timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote,unquote
 from io import BytesIO
@@ -2377,6 +2377,77 @@ STRIKE_MONITOR_CSS="""
 # No background worker, database writes, collector changes, or dependencies.
 # Yahoo/Cboe quote may be delayed; cache each external response across viewers.
 # -----------------------------------------------------------------------------
+# v6.15.7.4: Limit the three Yahoo index lookups to the NY trading day.
+# 09:30 NY through one hour after the NYSE closing bell; otherwise keep
+# the last in-memory quote and NEVER contact Yahoo. No timers/background work.
+_RPD_NY_ZONE=ZoneInfo("America/New_York")
+
+
+def _rpd_observed_holiday(holiday):
+    if holiday.weekday()==5: return holiday-timedelta(days=1)
+    if holiday.weekday()==6: return holiday+timedelta(days=1)
+    return holiday
+
+
+def _rpd_nth_weekday(year,month,weekday,n):
+    d=date(year,month,1)
+    return d+timedelta(days=(weekday-d.weekday())%7+7*(n-1))
+
+
+def _rpd_last_weekday(year,month,weekday):
+    d=date(year,month,calendar.monthrange(year,month)[1])
+    return d-timedelta(days=(d.weekday()-weekday)%7)
+
+
+def _rpd_easter_sunday(year):
+    # Gregorian Easter; used only to exclude the Good Friday market holiday.
+    a=year%19;b=year//100;c=year%100;d=b//4;e=b%4
+    f=(b+8)//25;g=(b-f+1)//3
+    h=(19*a+b-d-g+15)%30;i=c//4;k=c%4
+    l=(32+2*e+2*i-h-k)%7;m=(a+11*h+22*l)//451
+    month=(h+l-7*m+114)//31;day=(h+l-7*m+114)%31+1
+    return date(year,month,day)
+
+
+def _rpd_nyse_closed_day(today):
+    if today.weekday()>=5:return True
+    year=today.year
+    fixed=(date(year,1,1),date(year,6,19),date(year,7,4),date(year,12,25))
+    holidays={_rpd_observed_holiday(d) for d in fixed}
+    # Next year's New Year's Day can be observed on Dec 31 this year.
+    holidays.add(_rpd_observed_holiday(date(year+1,1,1)))
+    holidays.update((
+        _rpd_nth_weekday(year,1,0,3),   # MLK Day
+        _rpd_nth_weekday(year,2,0,3),   # Presidents Day
+        _rpd_easter_sunday(year)-timedelta(days=2), # Good Friday
+        _rpd_last_weekday(year,5,0),    # Memorial Day
+        _rpd_nth_weekday(year,9,0,1),   # Labor Day
+        _rpd_nth_weekday(year,11,3,4),  # Thanksgiving
+    ))
+    return today in holidays
+
+
+def _rpd_market_query_allowed(now_ny=None):
+    """True only 09:30–17:00 New York time on NYSE trading dates.
+
+    Standard early-close sessions stop at 14:00 NY (13:00 close + 1 hour).
+    """
+    now_ny=now_ny or datetime.now(_RPD_NY_ZONE)
+    if now_ny.tzinfo is None: raise ValueError("Timezone-aware NY datetime required")
+    now_ny=now_ny.astimezone(_RPD_NY_ZONE)
+    today=now_ny.date()
+    if _rpd_nyse_closed_day(today):return False
+    # Early closes: day after Thanksgiving, usual Christmas Eve,
+    # and the trading session immediately before Independence Day.
+    thanksgiving=_rpd_nth_weekday(today.year,11,3,4)
+    early=(today==thanksgiving+timedelta(days=1) or
+           (today.month==12 and today.day==24) or
+           (today.month==7 and today.day==3 and today.weekday()<5))
+    end=(14,0) if early else (17,0)
+    minute=now_ny.hour*60+now_ny.minute
+    return 9*60+30<=minute<end[0]*60+end[1]
+
+
 _VIX_YAHOO_URLS=(
     "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?range=1d&interval=1m",
     "https://query2.finance.yahoo.com/v8/finance/chart/%5EVIX?range=1d&interval=1m",
@@ -2453,6 +2524,9 @@ def _cached_yahoo_vix():
     # Small in-process TTL. No persistent storage or periodic background polling.
     now=time.monotonic()
     with _VIX_CACHE_LOCK:
+        if not _rpd_market_query_allowed():
+            old=_VIX_CACHE["last_good"]
+            return dict(old) if old else {"ok":False,"error":"Yahoo VIX quote paused outside NY market hours"}
         if now<_VIX_CACHE["next_check"]:
             old=_VIX_CACHE["last_good"]
             return dict(old) if old else {"ok":False,"error":"Yahoo VIX quote unavailable"}
@@ -2547,6 +2621,9 @@ def _cached_rpd_benchmark(code):
     now=time.monotonic()
     with _RPD_BENCHMARK_CACHE_LOCK:
         cache=_RPD_BENCHMARK_CACHE[code]
+        if not _rpd_market_query_allowed():
+            old=cache["last_good"]
+            return dict(old) if old else {"ok":False,"error":"Yahoo index quote paused outside NY market hours"}
         if now>=cache["next_check"]:
             try:
                 cache["last_good"]=_yahoo_rpd_benchmark(_RPD_BENCHMARKS[code])
