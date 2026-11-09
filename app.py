@@ -2246,6 +2246,32 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
         if key in seen:continue
         seen.add(key)
         result["total"]+=1
+        # Bloomberg MID for both PUT and CALL. Prefer a transmitted mid;
+        # otherwise derive it from the matching option BID/ASK pair only.
+        # Never substitute the underlying stock price or an option LAST quote.
+        irr=None
+        raw_premium=row.get("option_mid")
+        if raw_premium is None:
+            raw_premium=row.get("market_mid")
+        try:
+            if raw_premium is None:
+                bid=row.get("option_bid")
+                ask=row.get("option_ask")
+                if bid is None or ask is None:
+                    bid=row.get("market_bid")
+                    ask=row.get("market_ask")
+                bid=float(bid)
+                ask=float(ask)
+                if not (math.isfinite(bid) and math.isfinite(ask) and 0<=bid<=ask):
+                    raise ValueError("Invalid Bloomberg option bid/ask")
+                premium=(bid+ask)/2.0
+            else:
+                premium=float(raw_premium)
+            dte=(date.fromisoformat(expiry)-date.fromisoformat(today)).days
+            if math.isfinite(premium) and premium>=0 and dte>0:
+                irr=100.0*(premium/strike)*(365.0/dte)
+        except (ValueError,TypeError,OverflowError,ZeroDivisionError):
+            pass
         spot=None
         try:spot=float(row.get("underlying_spot"))
         except (TypeError,ValueError,OverflowError):pass
@@ -2254,13 +2280,13 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
             result["missing"]+=1
             # Missing Bloomberg price cannot be assumed far from strike.
             result["all_rows"].append({"ticker":ticker,"type":typ,"expiry":expiry,
-                                       "qty":abs(qty),"strike":strike,"spot":None,
+                                       "qty":abs(qty),"strike":strike,"spot":None,"irr":irr,
                                        "distance":None,"source":src})
             continue
         # Signed distance: OTM positive; ITM negative for BOTH puts and calls.
         distance_pct=100*((spot-strike) if typ=="P" else (strike-spot))/strike
         item={"ticker":ticker,"type":typ,"expiry":expiry,"qty":abs(qty),
-              "strike":strike,"spot":spot,"distance":distance_pct,"source":src}
+              "strike":strike,"spot":spot,"irr":irr,"distance":distance_pct,"source":src}
         result["all_rows"].append(item)
         if distance_pct<=10.0:result["rows"].append(item)
     result["rows"].sort(key=lambda r:(r["distance"],r["ticker"],r["expiry"]))
@@ -2280,7 +2306,11 @@ def _strike_row_html(row, exposure_report=None):
     exposure=_strike_pdf_exposure_info(exposure_report,row)
     pdf_date=html.escape(str((exposure_report or {}).get("report_date") or "No Nirvana PDF uploaded"),quote=True)
     exposure_label=("—" if exposure is None else f"{exposure:.2f}%")
-    return (f'<tr><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
+    irr=row.get("irr")
+    irr_label="—" if irr is None else f"{irr:,.2f}%"
+    irr_title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID = (BID + ASK) / 2; MID / Strike × 365 / calendar days to expiry."
+    irr_html=(f'<span class="strike-irr strike-irr-green">{irr_label}</span>' if irr is not None and irr<=10.0 else f'<span class="strike-irr">{irr_label}</span>')
+    return (f'<tr><td title="{irr_title}">{irr_html}</td><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
             f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
             f'<td>{html.escape(row["expiry"])}</td><td title="{tooltip}">{stock}</td><td>{dist_html}</td></tr>')
 
@@ -2303,13 +2333,13 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
             +('' if full else f'<a href="{url}">Open full list →</a>')+'</div>')
     meta=(f'<div class="strike-meta">Bloomberg only · {html.escape(data["state"])}'
           +(f' · {html.escape(data["source_date"])}' if data["source_date"] else '')+'</div>')
-    message=('<tr><td colspan="8" class="strike-empty">'
+    message=('<tr><td colspan="9" class="strike-empty">'
              +('Waiting for current Bloomberg data.' if data["message"] else
                'No active options available.' if data["total"]==0 else
                'No positions within 10% of strike or ITM.' if not full else
                'No positions with a valid Bloomberg price.')+'</td></tr>')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
-         '<th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID (BID + ASK) / 2. MID / Strike times 365 / days to expiry.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
          +(''.join(_strike_row_html(r,exposure_report) for r in rows) if rows else message)
          +'</tbody></table></div>')
@@ -2321,12 +2351,14 @@ STRIKE_MONITOR_CSS="""
 .strike-panel .panelhead{margin-bottom:4px}
 .strike-meta{font-size:10.5px;color:#64748b;margin-bottom:6px}
 .strike-table-scroll{max-width:100%;overflow-x:auto}
-.strike-table{width:100%;min-width:720px;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.strike-table{width:100%;min-width:785px;border-collapse:collapse;font-variant-numeric:tabular-nums}
 .strike-table th,.strike-table td{padding:6px 8px;font-size:11.5px;white-space:nowrap;border-bottom:1px solid #e8edf4}
 .strike-table th{background:#f6f9fd;color:#182642;text-align:center;font-weight:700}
 .strike-table td{text-align:center}
-.strike-table th:nth-child(3),.strike-table td:nth-child(3){text-align:left;font-weight:650}
+.strike-table th:nth-child(4),.strike-table td:nth-child(4){text-align:left;font-weight:650}
 .strike-exposure-info{cursor:help;text-decoration:none;border:0;font-size:11px;color:#4c648b;font-weight:600}
+.strike-irr{display:inline-block;min-width:68px;padding:5px 7px;border-radius:7px;font-weight:700;font-variant-numeric:tabular-nums;color:#182642}
+.strike-irr-green{background:#dcfce7;color:#166534}
 .strike-table tr:last-child td{border-bottom:0}
 .strike-distance{display:inline-block;min-width:96px;border-radius:7px;padding:5px 9px;text-align:center;font-weight:750}
 .strike-distance.strike-watch{background:#fff0b3;color:#936000}
@@ -2337,7 +2369,7 @@ STRIKE_MONITOR_CSS="""
 .strike-note{font-size:11px;color:#6b7280;margin:5px 0 7px}
 .strike-note.strike-alert{color:#9a3412}
 .strike-empty{text-align:center!important;color:#6b7280;font-weight:400!important;padding:13px!important}
-@media(max-width:760px){.strike-table{min-width:720px}.strike-panel .headgroup{gap:5px}}
+@media(max-width:760px){.strike-table{min-width:785px}.strike-panel .headgroup{gap:5px}}
 """
 
 # -----------------------------------------------------------------------------
@@ -2453,6 +2485,102 @@ VIX_OVERVIEW_BADGE=(
     '</div>'
 )
 
+
+# v6.15.7 — read-only Yahoo Total Return benchmarks for Fortress title.
+# On-demand only, in-memory cache, same policy as existing VIX. No scheduled worker.
+_RPD_BENCHMARKS={"sp500tr":"^SP500TR","ruttr":"^RUTTR"}
+_RPD_BENCHMARK_CACHE_LOCK=threading.Lock()
+_RPD_BENCHMARK_CACHE={k:{"next_check":0.0,"last_good":None} for k in _RPD_BENCHMARKS}
+
+
+def _parse_rpd_benchmark_chart(document, expected_symbol):
+    chart=(document or {}).get("chart") or {}
+    if chart.get("error"):
+        raise ValueError("Yahoo returned quote error")
+    records=chart.get("result") or []
+    if not records:
+        raise ValueError("Yahoo returned no quote")
+    record=records[0]
+    meta=record.get("meta") or {}
+    actual=str(meta.get("symbol") or "").upper()
+    if actual and actual!=expected_symbol.upper():
+        raise ValueError("Unexpected index symbol")
+    price=meta.get("regularMarketPrice")
+    if price is None:
+        ticks=((record.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+        price=next((v for v in reversed(ticks) if v is not None),None)
+    price=float(price)
+    if not math.isfinite(price) or price<=0:
+        raise ValueError("Invalid index price")
+    prior=None
+    for field in ("regularMarketPreviousClose","previousClose","chartPreviousClose"):
+        try:
+            val=float(meta.get(field))
+            if math.isfinite(val) and val>0:
+                prior=val;break
+        except (TypeError,ValueError):
+            pass
+    change=(price-prior) if prior is not None else None
+    return {"ok":True,"price":round(price,4),"change":round(change,4) if change is not None else None,
+            "change_pct":round(change/prior*100,4) if change is not None else None,
+            "symbol":expected_symbol,"stale":False}
+
+
+def _yahoo_rpd_benchmark(symbol):
+    headers={"User-Agent":"Mozilla/5.0 (compatible; RPD-Market-Overview/1.0)",
+             "Accept":"application/json"}
+    last=None
+    for host in ("query1.finance.yahoo.com","query2.finance.yahoo.com"):
+        url=f"https://{host}/v8/finance/chart/{quote(symbol,safe='')}?range=1d&interval=1m"
+        try:
+            with urlopen(UrlRequest(url,headers=headers),timeout=3) as response:
+                document=json.loads(response.read(512_000))
+            return _parse_rpd_benchmark_chart(document,symbol)
+        except Exception as error:
+            last=error
+    raise RuntimeError("Yahoo benchmark unavailable") from last
+
+
+def _cached_rpd_benchmark(code):
+    if code not in _RPD_BENCHMARKS:
+        raise HTTPException(404,"Unknown benchmark")
+    now=time.monotonic()
+    with _RPD_BENCHMARK_CACHE_LOCK:
+        cache=_RPD_BENCHMARK_CACHE[code]
+        if now>=cache["next_check"]:
+            try:
+                cache["last_good"]=_yahoo_rpd_benchmark(_RPD_BENCHMARKS[code])
+                cache["next_check"]=time.monotonic()+300
+            except Exception:
+                cache["next_check"]=time.monotonic()+180
+                if cache["last_good"]:
+                    return {**cache["last_good"],"stale":True}
+        if cache["last_good"]:
+            return dict(cache["last_good"])
+    return {"ok":False,"error":"Yahoo Finance quote unavailable"}
+
+
+@app.get("/api/market/benchmark/{code}")
+def market_benchmark_quote(request:Request,code:str):
+    require_user(request)
+    return _cached_rpd_benchmark(code)
+
+
+FORTRESS_TR_OVERVIEW_BADGE=(
+    '<div class="rpd-tr-group">'
+    '<span class="rpd-tr-item" id="rpd-tr-sp500tr" title="Yahoo Finance ^SP500TR · 15-min delayed">'
+    '<span class="rpd-vix-label">S&amp;P 500 TR</span> '
+    '<strong class="rpd-vix-price" data-price>—</strong> '
+    '<span class="rpd-vix-change" data-change>Yahoo Finance</span>'
+    '</span>'
+    '<span class="rpd-tr-item" id="rpd-tr-ruttr" title="Yahoo Finance ^RUTTR · 15-min delayed">'
+    '<span class="rpd-vix-label">Russell 2000 TR</span> '
+    '<strong class="rpd-vix-price" data-price>—</strong> '
+    '<span class="rpd-vix-change" data-change>Yahoo Finance</span>'
+    '</span>'
+    '</div>'
+)
+
 @app.get("/overview")
 def overview(request:Request):
     u=require_user(request)
@@ -2507,7 +2635,7 @@ def overview(request:Request):
     def limit_txt(x): return "—" if x is None else f"{x:.3f}%"
     def buffer_txt(x): return "—" if x is None else f"{x:+.3f}%"
     def fund_column(title,accent,delta_link,dstatus,dsub,dpct,dusd,limit,buffer,dcov,collector,portalv,bd_link,bd_status,bd_ret,bd_pnl,nav,report,bd_cov,y_link,y_status,y_ret,y_pnl,y_cov,strike_data,fund_key,pdf_exposure):
-        return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2>{VIX_OVERVIEW_BADGE if accent=="opportunity" else ""}</div>
+        return f'''<section class="fundcol"><div class="fundtitle {accent}"><h2>{title}</h2>{VIX_OVERVIEW_BADGE if accent=="opportunity" else FORTRESS_TR_OVERVIEW_BADGE}</div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Delta Monitor</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{delta_link}">Open full monitor →</a></div><div class="mini-grid">
         <div class="mini"><span>Feed</span><b class="ok">{html.escape(dstatus)}</b><small>{html.escape(dsub)}</small></div><div class="mini"><span>Delta Exposure</span><b>{dpct:.3f}%</b><small>${dusd:,.0f}</small></div><div class="mini"><span>Limit</span><b>{limit_txt(limit)}</b></div><div class="mini"><span>Buffer</span><b class="{cls(buffer or 0) if buffer is not None else ''}">{buffer_txt(buffer)}</b></div><div class="mini"><span>Coverage</span><b>{dcov}</b><small>Collector v{collector} / Portal v{portalv}</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Daily Return</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
@@ -2515,7 +2643,7 @@ def overview(request:Request):
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key,exposure_report=pdf_exposure)}</section>'''
 
-    body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff}}.fundtitle.opportunity{{background:#f5efff;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}.rpd-vix{{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums;white-space:nowrap}}.rpd-vix-label{{font-size:12.5px;font-weight:700;letter-spacing:.2px;color:#475569}}.rpd-vix-price{{font-size:19px;font-weight:800;color:#17233a}}.rpd-vix-change{{font-size:12px;font-weight:750;color:#63728b}}.rpd-vix-change.is-up{{color:#087a4b}}.rpd-vix-change.is-down{{color:#c22a20}}.rpd-vix-delay{{background:#eef3fb;border:1px solid #dde7f5;color:#2d4771;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:650}}@media(max-width:800px){{.rpd-vix{{gap:5px}}.rpd-vix-delay{{font-size:9px}}.rpd-vix-price{{font-size:17px}}}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
+    body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}}.rpd-tr-group{{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:nowrap;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:0;max-width:100%}}.rpd-tr-item{{display:inline-flex;align-items:center;gap:4px;min-width:0}}.rpd-tr-group .rpd-vix-label{{font-size:10px;letter-spacing:0}}.rpd-tr-group .rpd-vix-price{{font-size:13px}}.rpd-tr-group .rpd-vix-change{{font-size:10px}}@media(max-width:1510px){{.fundtitle.fortress h2{{font-size:20px}}.rpd-tr-group{{gap:5px}}.rpd-tr-group .rpd-vix-label{{font-size:9px}}.rpd-tr-group .rpd-vix-price{{font-size:11.5px}}.rpd-tr-group .rpd-vix-change{{font-size:9px}}}}@media(max-width:1330px){{.fundtitle.fortress{{flex-wrap:wrap}}.rpd-tr-group{{flex-wrap:wrap}}}}.fundtitle.opportunity{{background:#f5efff;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}.rpd-vix{{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums;white-space:nowrap}}.rpd-vix-label{{font-size:12.5px;font-weight:700;letter-spacing:.2px;color:#475569}}.rpd-vix-price{{font-size:19px;font-weight:800;color:#17233a}}.rpd-vix-change{{font-size:12px;font-weight:750;color:#63728b}}.rpd-vix-change.is-up{{color:#087a4b}}.rpd-vix-change.is-down{{color:#c22a20}}.rpd-vix-delay{{background:#eef3fb;border:1px solid #dde7f5;color:#2d4771;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:650}}@media(max-width:800px){{.rpd-vix{{gap:5px}}.rpd-vix-delay{{font-size:9px}}.rpd-vix-price{{font-size:17px}}}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
     <div class="funds">
     {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov,ostrike,"opportunity",o_pdf_exposure)}
     {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov,fstrike,"fortress",f_pdf_exposure)}
@@ -2540,6 +2668,29 @@ def overview(request:Request):
           root.title='Yahoo Finance · delayed VIX quote'+(data.quote_time_ny?' · '+data.quote_time_ny:'')+(data.stale?' · Stale cache':'');
         }})
         .catch(()=>{{value.textContent='—';change.textContent='Unavailable';}});
+    }})();
+    (function(){{
+      const defs=[['sp500tr','rpd-tr-sp500tr'],['ruttr','rpd-tr-ruttr']];
+      defs.forEach(([code,id])=>{{
+        const element=document.getElementById(id);
+        if(!element)return;
+        const price=element.querySelector('[data-price]');
+        const change=element.querySelector('[data-change]');
+        fetch('/api/market/benchmark/'+code,{{credentials:'same-origin',cache:'no-store'}})
+          .then(r=>{{if(!r.ok)throw new Error('Unavailable');return r.json();}})
+          .then(data=>{{
+            if(!data.ok || !Number.isFinite(Number(data.price)))throw new Error('Unavailable');
+            price.textContent=Number(data.price).toLocaleString('en-US',{{minimumFractionDigits:2,maximumFractionDigits:2}});
+            const c=Number(data.change), pct=Number(data.change_pct);
+            change.classList.remove('is-up','is-down');
+            if(data.change!==null && data.change_pct!==null && Number.isFinite(c) && Number.isFinite(pct)){{
+              change.textContent=(c>=0?'+':'')+c.toFixed(2)+' ('+(pct>=0?'+':'')+pct.toFixed(2)+'%)';
+              change.classList.add(c>0?'is-up':c<0?'is-down':'');
+            }}else{{change.textContent='Change unavailable';}}
+            if(data.stale)change.textContent+=' · STALE';
+          }})
+          .catch(()=>{{price.textContent='—';change.textContent='Unavailable';}});
+      }});
     }})();</script>
 '''
 
