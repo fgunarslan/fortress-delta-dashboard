@@ -2199,6 +2199,44 @@ def _strike_pdf_exposure_info(report, row):
         return None
 
 
+def _strike_option_mid(row):
+    """Read an option quote from the Bloomberg snapshot without using Last/spot.
+
+    MID = (BID + ASK) / 2. When ASK exists but BID is missing,
+    set BID to zero. ASK unavailable => no reliable midpoint.
+    """
+    def valid_quote(value):
+        try:
+            if value is None or value=="":
+                return None
+            parsed=float(value)
+            return parsed if math.isfinite(parsed) and parsed>=0 else None
+        except (ValueError,TypeError,OverflowError):
+            return None
+
+    # The collector provides both names depending on snapshot generation.
+    # Use an option-side quote first; supplement from market-side fields.
+    bid=valid_quote(row.get("option_bid"))
+    ask=valid_quote(row.get("option_ask"))
+    if bid is None:
+        bid=valid_quote(row.get("market_bid"))
+    if ask is None:
+        ask=valid_quote(row.get("market_ask"))
+    if ask is not None:
+        if bid is None:
+            bid=0.0
+        if bid<=ask:
+            return (bid+ask)/2.0
+        return None  # Crossed quote; don't produce misleading IRR.
+
+    # Some collector payloads provide a precomputed option MID instead.
+    for name in ("option_mid","market_mid"):
+        mid=valid_quote(row.get(name))
+        if mid is not None:
+            return mid
+    return None
+
+
 # v6.15.2 - Bloomberg-only Strike Proximity Monitor.
 # This presentation helper consumes Collector v4.2 snapshots but never mutates
 # positions, exposure settings, expiration state, or daily-return prices.
@@ -2246,29 +2284,15 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
         if key in seen:continue
         seen.add(key)
         result["total"]+=1
-        # Bloomberg MID for both PUT and CALL. Prefer a transmitted mid;
-        # otherwise derive it from the matching option BID/ASK pair only.
-        # Never substitute the underlying stock price or an option LAST quote.
+        # v6.15.7.5: both PUT/CALL use Bloomberg option MID for the
+        # annualized premium return. A missing BID is treated as zero only
+        # when ASK is available (same fallback as Bloomberg Daily Return).
+        # Keep the IRR quote calculation separate from the Daily Return engine.
         irr=None
-        raw_premium=row.get("option_mid")
-        if raw_premium is None:
-            raw_premium=row.get("market_mid")
+        premium=_strike_option_mid(row)
         try:
-            if raw_premium is None:
-                bid=row.get("option_bid")
-                ask=row.get("option_ask")
-                if bid is None or ask is None:
-                    bid=row.get("market_bid")
-                    ask=row.get("market_ask")
-                bid=float(bid)
-                ask=float(ask)
-                if not (math.isfinite(bid) and math.isfinite(ask) and 0<=bid<=ask):
-                    raise ValueError("Invalid Bloomberg option bid/ask")
-                premium=(bid+ask)/2.0
-            else:
-                premium=float(raw_premium)
             dte=(date.fromisoformat(expiry)-date.fromisoformat(today)).days
-            if math.isfinite(premium) and premium>=0 and dte>0:
+            if premium is not None and dte>0:
                 irr=100.0*(premium/strike)*(364.0/dte)
         except (ValueError,TypeError,OverflowError,ZeroDivisionError):
             pass
@@ -2308,7 +2332,7 @@ def _strike_row_html(row, exposure_report=None):
     exposure_label=("—" if exposure is None else f"{exposure:.2f}%")
     irr=row.get("irr")
     irr_label="—" if irr is None else f"{irr:,.2f}%"
-    irr_title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID = (BID + ASK) / 2; MID / Strike × 364 / calendar days to expiry."
+    irr_title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); MID / Strike × 364 / calendar days to expiry."
     irr_html=(f'<span class="strike-irr strike-irr-green">{irr_label}</span>' if irr is not None and irr<=10.0 else f'<span class="strike-irr">{irr_label}</span>')
     return (f'<tr><td title="{irr_title}">{irr_html}</td><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
             f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
@@ -2339,7 +2363,7 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
                'No positions within 10% of strike or ITM.' if not full else
                'No positions with a valid Bloomberg price.')+'</td></tr>')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
-         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID (BID + ASK) / 2. MID / Strike times 364 / days to expiry.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID (BID + ASK) / 2; missing BID is zero when ASK exists. MID / Strike times 364 / days to expiry.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
          +(''.join(_strike_row_html(r,exposure_report) for r in rows) if rows else message)
          +'</tbody></table></div>')
@@ -2533,7 +2557,7 @@ def _cached_yahoo_vix():
         try:
             result=_load_yahoo_vix()
             _VIX_CACHE["last_good"]=result
-            _VIX_CACHE["next_check"]=time.monotonic()+300  # 5 min query interval
+            _VIX_CACHE["next_check"]=time.monotonic()+60  # 1 min query interval; shared among viewers
             return dict(result)
         except Exception:
             _VIX_CACHE["next_check"]=time.monotonic()+180  # avoid retry storms
@@ -2551,11 +2575,11 @@ def market_vix_quote(request:Request):
 
 VIX_OVERVIEW_BADGE=(
     '<div class="rpd-vix" id="rpd-vix" '
-    'title="Yahoo Finance VIX (^VIX) · 15-min delayed quote">'
+    'title="Yahoo Finance VIX (^VIX) · refreshes at most once per minute while the market is open; source quote may be delayed">'
     '<span class="rpd-vix-label">VIX</span>'
     '<strong class="rpd-vix-price" id="rpd-vix-price">—</strong>'
     '<span class="rpd-vix-change" id="rpd-vix-change">Yahoo Finance</span>'
-    '<span class="rpd-vix-delay">◷ 15-min delayed</span>'
+    '<span class="rpd-vix-delay" title="Yahoo quote may be delayed; 1-minute refresh is not guaranteed real-time pricing">◷ 1-min delayed</span>'
     '</div>'
 )
 
@@ -2627,7 +2651,7 @@ def _cached_rpd_benchmark(code):
         if now>=cache["next_check"]:
             try:
                 cache["last_good"]=_yahoo_rpd_benchmark(_RPD_BENCHMARKS[code])
-                cache["next_check"]=time.monotonic()+300
+                cache["next_check"]=time.monotonic()+60  # 1 min shared query interval
             except Exception:
                 cache["next_check"]=time.monotonic()+180
                 if cache["last_good"]:
@@ -2645,16 +2669,17 @@ def market_benchmark_quote(request:Request,code:str):
 
 FORTRESS_TR_OVERVIEW_BADGE=(
     '<div class="rpd-tr-group">'
-    '<span class="rpd-tr-item" id="rpd-tr-sp500tr" title="Yahoo Finance ^SP500TR · 15-min delayed">'
+    '<span class="rpd-tr-item" id="rpd-tr-sp500tr" title="Yahoo Finance ^SP500TR · refreshed at most every minute; source quote may be delayed">'
     '<span class="rpd-vix-label">S&amp;P 500 TR</span> '
     '<strong class="rpd-vix-price" data-price>—</strong> '
     '<span class="rpd-vix-change" data-change>Yahoo Finance</span>'
     '</span>'
-    '<span class="rpd-tr-item" id="rpd-tr-ruttr" title="Yahoo Finance ^RUTTR · 15-min delayed">'
+    '<span class="rpd-tr-item" id="rpd-tr-ruttr" title="Yahoo Finance ^RUTTR · refreshed at most every minute; source quote may be delayed">'
     '<span class="rpd-vix-label">Russell 2000 TR</span> '
     '<strong class="rpd-vix-price" data-price>—</strong> '
     '<span class="rpd-vix-change" data-change>Yahoo Finance</span>'
     '</span>'
+    '<span class="rpd-tr-refresh rpd-vix-delay" title="Yahoo quotes may be delayed; 1-minute refresh is not guaranteed real-time pricing">◷ 1-min delayed</span>'
     '</div>'
 )
 
@@ -2720,7 +2745,7 @@ def overview(request:Request):
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key,exposure_report=pdf_exposure)}</section>'''
 
-    body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}}.rpd-tr-group{{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:nowrap;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:0;max-width:100%}}.rpd-tr-item{{display:inline-flex;align-items:center;gap:4px;min-width:0}}.rpd-tr-group .rpd-vix-label{{font-size:11px;letter-spacing:0}}.rpd-tr-group .rpd-vix-price{{font-size:14px}}.rpd-tr-group .rpd-vix-change{{font-size:11px}}@media(max-width:1510px){{.fundtitle.fortress h2{{font-size:20px}}.rpd-tr-group{{gap:5px}}.rpd-tr-group .rpd-vix-label{{font-size:10px}}.rpd-tr-group .rpd-vix-price{{font-size:12.5px}}.rpd-tr-group .rpd-vix-change{{font-size:10px}}}}@media(max-width:1330px){{.fundtitle.fortress{{flex-wrap:wrap}}.rpd-tr-group{{flex-wrap:wrap}}}}.fundtitle.opportunity{{background:#f5efff;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}.rpd-vix{{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums;white-space:nowrap}}.rpd-vix-label{{font-size:12.5px;font-weight:700;letter-spacing:.2px;color:#475569}}.rpd-vix-price{{font-size:19px;font-weight:800;color:#17233a}}.rpd-vix-change{{font-size:12px;font-weight:750;color:#63728b}}.rpd-vix-change.is-up{{color:#087a4b}}.rpd-vix-change.is-down{{color:#c22a20}}.rpd-vix-delay{{background:#eef3fb;border:1px solid #dde7f5;color:#2d4771;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:650}}@media(max-width:800px){{.rpd-vix{{gap:5px}}.rpd-vix-delay{{font-size:9px}}.rpd-vix-price{{font-size:17px}}}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
+    body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}}.rpd-tr-group{{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:nowrap;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:0;max-width:100%}}.rpd-tr-item{{display:inline-flex;align-items:center;gap:4px;min-width:0}}.rpd-tr-group .rpd-vix-label{{font-size:11px;letter-spacing:0}}.rpd-tr-group .rpd-vix-price{{font-size:14px}}.rpd-tr-group .rpd-vix-change{{font-size:11px}}.rpd-tr-refresh{{flex:0 0 auto;font-size:9px;padding:2px 5px;white-space:nowrap}}@media(max-width:1510px){{.fundtitle.fortress h2{{font-size:20px}}.rpd-tr-group{{gap:5px;flex-wrap:wrap}}.rpd-tr-group .rpd-vix-label{{font-size:10px}}.rpd-tr-group .rpd-vix-price{{font-size:12.5px}}.rpd-tr-group .rpd-vix-change{{font-size:10px}}}}@media(max-width:1330px){{.fundtitle.fortress{{flex-wrap:wrap}}.rpd-tr-group{{flex-wrap:wrap}}}}.fundtitle.opportunity{{background:#f5efff;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}.rpd-vix{{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums;white-space:nowrap}}.rpd-vix-label{{font-size:12.5px;font-weight:700;letter-spacing:.2px;color:#475569}}.rpd-vix-price{{font-size:19px;font-weight:800;color:#17233a}}.rpd-vix-change{{font-size:12px;font-weight:750;color:#63728b}}.rpd-vix-change.is-up{{color:#087a4b}}.rpd-vix-change.is-down{{color:#c22a20}}.rpd-vix-delay{{background:#eef3fb;border:1px solid #dde7f5;color:#2d4771;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:650}}@media(max-width:800px){{.rpd-vix{{gap:5px}}.rpd-vix-delay{{font-size:9px}}.rpd-vix-price{{font-size:17px}}}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}</style>
     <div class="funds">
     {fund_column("RPD Opportunity Fund","opportunity","/opportunity",odelta_status,odelta_sub,odelta_pct,odelta_usd,olimit,obuffer,odelta_cov,ocollector,ocfg,"/opportunity/bloomberg-daily-return",ob_status,ob_ret,ob_pnl,onav,oreport,ob_cov,"/opportunity/yahoo-daily-return",oy_status,oy_ret,oy_pnl,oy_cov,ostrike,"opportunity",o_pdf_exposure)}
     {fund_column("RPD Fortress Fund","fortress","/",fdelta_status,fdelta_sub,fdelta_pct,fdelta_usd,flimit,fbuffer,fdelta_cov,fcollector,fcfg,"/bloomberg-daily-return",fb_status,fb_ret,fb_pnl,fnav,freport,fb_cov,"/daily-return",fy_status,fy_ret,fy_pnl,fy_cov,fstrike,"fortress",f_pdf_exposure)}
