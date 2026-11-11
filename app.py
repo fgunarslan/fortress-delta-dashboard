@@ -550,6 +550,13 @@ form[style*="display:flex"]{{align-items:center!important}}form[style*="display:
   .daily-bloomberg tbody td:nth-child(11)::before{{content:"IRR ⓘ"}}
   .daily-bloomberg tbody td:nth-child(12)::before{{content:"OOM"}}
 }}
+/* v6.15.7.13: center IRR and OOM headers over their values, desktop only.
+   Narrow layouts keep the existing stacked mobile-card alignment. */
+@media(min-width:761px){{
+  .daily-return-table.daily-bloomberg thead th:nth-last-child(-n+2),
+  .daily-return-table.daily-bloomberg tbody td:nth-last-child(-n+2){{text-align:center}}
+}}
+
 /* v6.15.7.12: Only the Bloomberg Daily Return OOM column; DO NOT reuse
    Strike Proximity's separate red/orange/yellow rules. */
 .daily-bloomberg .daily-oom{{display:inline-block;min-width:67px;padding:5px 7px;border-radius:7px;font-weight:700;font-variant-numeric:tabular-nums;color:#182642;text-align:center}}
