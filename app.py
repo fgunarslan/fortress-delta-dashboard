@@ -1603,6 +1603,29 @@ def _collect_delta_export(fund_key):
         "report_key":"delta",
     }
 
+def _daily_market_value(row):
+    """Mark-to-market position value, signed with quantity.
+
+    Contract size is 100 for options; equities use 1 share.  This
+    is display/export only and never affects daily P&L calculations.
+    """
+    market=row.get("market_mark")
+    if market is None:
+        return None
+    try:
+        qty=float(row.get("quantity") or 0)
+        instrument=str(row.get("instrument_type") or "").upper()
+        multiplier=100 if instrument=="OPTION" else 1
+        return float(market)*qty*multiplier
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _daily_market_value_html(row):
+    value=_daily_market_value(row)
+    return "—" if value is None else f'${value:,.2f}'
+
+
 def _collect_daily_export(fund_key,source_key):
     with SessionLocal() as db:
         if fund_key=="fortress":
@@ -1670,7 +1693,7 @@ def _collect_daily_export(fund_key,source_key):
             bid,
             ask,
             market,
-            manual,
+            _daily_market_value(r),
             current,
             r.get("change"),
             r.get("estimated_pnl"),
@@ -1681,7 +1704,7 @@ def _collect_daily_export(fund_key,source_key):
     headers=[
         "Position","Qty","Previous Mark",
         f"{source_name} Bid",f"{source_name} Ask",f"{source_name} Market",
-        "Manual Override","Effective Price","Change",
+        "Market Value","Effective Price","Change",
         "Estimated P&L","Contribution","Effective Source",
     ]
     return {
@@ -1689,7 +1712,7 @@ def _collect_daily_export(fund_key,source_key):
         "summary":summary,
         "headers":headers,
         "rows":rows,
-        "formats":["text","integer","price","price","price","price","price","price","price","currency2","percent4","text"],
+        "formats":["text","integer","price","price","price","price","currency2","price","price","currency2","percent4","text"],
         "fund":fund_key,
         "report_key":f"{source_key}-daily-return",
     }
@@ -1792,7 +1815,7 @@ def _pdf_report_bytes(report):
     elif len(report["headers"])<=4:
         widths=[260,90,170,170]
     else:
-        widths=[112,48,52,45,45,50,55,52,45,62,52,65]
+        widths=[112,48,52,45,45,50,65,52,45,62,52,65]
 
     total=sum(widths)
     usable=page_w-2*margin
@@ -2900,13 +2923,11 @@ def _render_opportunity_yahoo(request:Request):
     status="FULL" if calc["complete"] else "PARTIAL";ret=float(calc.get("estimated_return_pct") or 0);pnl=float(calc.get("estimated_pnl") or 0);rows=""
     for r in calc["rows"]:
         strike="" if r.get("strike") is None else f'{r["strike"]:g}';posname=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"]);manual=r.get("manual_price");manual_val='' if manual is None else f'{float(manual):.4f}'
-        if u["username"]==ADMIN_USER and r.get("id") is not None:
-            mh=f'<form method="post" action="/admin/opportunity/manual-price" style="display:flex;gap:4px"><input type="hidden" name="position_id" value="{r["id"]}"><input type="hidden" name="source" value="YAHOO"><input type="number" step="0.0001" min="0" name="price" value="{manual_val}" style="width:82px"><button>Save</button><button name="clear" value="1">Clear</button></form>'
-        else: mh='—' if not manual_val else f'${float(manual_val):.4f}'
+        mh=_daily_market_value_html(r)
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
         rows+=f'<tr><td>{html.escape(posname)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("previous_mark"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
     warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Yahoo local collector has not supplied a usable current mark for every Opportunity position.</div><br>'
-    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    body=f'''<h1>RPD Opportunity Fund — Yahoo Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Yahoo local collector marks</div></div></div>{warn}<div class="card"><strong>{html.escape(str(b.get('filename') or 'Opportunity PNL'))}</strong> · Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark.</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Market Value</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Opportunity Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/opportunity/yahoo-daily-return")
@@ -2925,13 +2946,11 @@ def opportunity_bloomberg_daily_return(request:Request):
     ret=float(calc["estimated_return_pct"]);pnl=float(calc["estimated_pnl"]);rows=""
     for r in calc["rows"]:
         strike="" if r.get("strike") is None else f'{r["strike"]:g}';name=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"]);manual=r.get("bloomberg_manual_price");mv='' if manual is None else f'{float(manual):.4f}'
-        if u["username"]==ADMIN_USER and r.get("id") is not None:
-            mh=f'<form method="post" action="/admin/opportunity/manual-price" style="display:flex;gap:4px"><input type="hidden" name="position_id" value="{r["id"]}"><input type="hidden" name="source" value="BLOOMBERG"><input type="number" step="0.0001" min="0" name="price" value="{mv}" style="width:82px"><button>Save</button><button name="clear" value="1">Clear</button></form>'
-        else: mh='—' if not mv else f'${float(mv):.4f}'
+        mh=_daily_market_value_html(r)
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
         rows+=f'<tr><td>{html.escape(name)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("baseline_price"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{mh}</td><td>{fmt(r.get("current_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{"—" if r.get("contribution_pct") is None else f"{r["contribution_pct"]:+.4f}%"}</td><td>{html.escape(r.get("effective_source") or "")}</td></tr>'
     status="FULL" if calc["complete"] else "PARTIAL";warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Bloomberg has not supplied a usable current mark for every Opportunity position.</div><br>'
-    body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+    body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Market Value</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Opportunity Bloomberg Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 @app.get("/admin/opportunity")
@@ -3487,14 +3506,7 @@ def daily_return_page(request:Request):
         epnl='—' if r.get("estimated_pnl") is None else f'${r["estimated_pnl"]:+,.2f}'
         contrib='—' if r.get("contribution_pct") is None else f'{r["contribution_pct"]:+.4f}%'
         source=(r.get("effective_source") or "")
-        if u["username"]==ADMIN_USER and r.get("id") is not None:
-            manual_html=(f'<form method="post" action="/admin/daily-return/manual-price" style="display:flex;gap:4px;align-items:center">'
-                         f'<input type="hidden" name="position_id" value="{r["id"]}">'
-                         f'<input type="hidden" name="source" value="YAHOO">'
-                         f'<input type="number" step="0.0001" min="0" name="price" value="{manual_val}" style="width:82px">'
-                         f'<button>Save</button><button name="clear" value="1">Clear</button></form>')
-        else:
-            manual_html='—' if not manual_val else f'${float(manual_val):.4f}'
+        manual_html=_daily_market_value_html(r)
         rows+=f'<tr><td>{html.escape(posname)}</td><td>{r["quantity"]:,.0f}</td><td>{previous}</td><td>{bid}</td><td>{ask}</td><td>{market}</td><td>{manual_html}</td><td>{current}</td><td>{change}</td><td>{epnl}</td><td>{contrib}</td><td>{html.escape(source)}</td></tr>'
 
     warning=""
@@ -3532,7 +3544,7 @@ def daily_return_page(request:Request):
 <strong>{html.escape(baseline['filename'])}</strong> · Report Date {html.escape(baseline['report_date'])} · NAV ${baseline['nav_usd']:,.2f}
 <br><div class="muted" style="margin-top:6px">Calculated {html.escape(ny_time_label(calc['calculated_at_utc']))}. Current Mark is supplied by the local Yahoo Collector: Bid/Ask midpoint when both are available; if Bid is zero/unavailable and Ask is available, Ask/2; otherwise Yahoo Last. Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark. Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.</div>
 </div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Yahoo Bid</th><th>Yahoo Ask</th><th>Yahoo Market</th><th>Market Value</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Yahoo Daily Return",body,u,60 if auto_refresh_allowed() else None)
 
 
@@ -3596,13 +3608,7 @@ def bloomberg_daily_return_page(request:Request):
         manual=r.get("bloomberg_manual_price")
         manual_val="" if manual is None else f'{float(manual):.4f}'
         pid=r.get("position_id")
-        if u["username"]==ADMIN_USER and pid is not None:
-            manual_html=(f'<form method="post" action="/admin/daily-return/manual-price" style="display:flex;gap:4px">'
-                f'<input type="hidden" name="position_id" value="{pid}">'
-                f'<input type="hidden" name="source" value="BLOOMBERG">'
-                f'<input type="number" step="0.0001" min="0" name="price" value="{manual_val}" style="width:82px">'
-                f'<button>Save</button><button name="clear" value="1">Clear</button></form>')
-        else:manual_html="—" if not manual_val else f'${float(manual):.4f}'
+        manual_html=_daily_market_value_html(r)
         rows+=(f'<tr><td>{html.escape(posname)}</td><td>{float(r.get("quantity") or 0):,.0f}</td>'
                f'<td>{prev_txt}</td><td>{bid_txt}</td><td>{ask_txt}</td><td>{market_txt}</td>'
                f'<td>{manual_html}</td><td>{cur_txt}</td><td>{chg_txt}</td><td>{pnl_txt}</td>'
@@ -3640,7 +3646,7 @@ Bloomberg snapshot: {html.escape(format_new_york_time(snapshot_ts)) if snapshot_
 Formula: (Current Mark − Previous P&amp;L Report Price) × Quantity × Multiplier. v6.15 intraday adjustments: Signed Trade Qty × (Current Mark − Execution Price) × Multiplier; confirmed worthless and automatically estimated OTM expirations use a zero mark.
 Daily Return = Total Estimated P&amp;L ÷ Baseline NAV.
 </div></div>
-<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Manual Override</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+<div class="card"><table><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Market Value</th><th>Effective Price</th><th>Change</th><th>Estimated P&amp;L</th><th>Contribution</th><th>Effective Source</th></tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Bloomberg Daily Return",body,u,60)
 
 @app.get("/admin/daily-return")
