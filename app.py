@@ -2376,13 +2376,15 @@ def _strike_option_mid(row):
 
 
 
-# v6.15.7.11: Display-only Bloomberg Daily Return IRR. These helpers read
-# the existing collector snapshot and do not mutate Daily Return rows, pricing,
-# NAV, P&L, contributions, exports, trades, or the database.
+# v6.15.7.15: Display-only Bloomberg Daily Return IRR. Match Nirvana's
+# annualized premium return denominator: PUT = Strike, CALL = Bloomberg
+# underlying spot. Read only validated quotes; never change Daily Return P&L.
 _DAILY_BLOOMBERG_IRR_TOOLTIP = (
-    "Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg "
-    "option MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); "
-    "MID / Strike × 364 / calendar days to expiry."
+    "Annualized Premium Return (not true IRR): Bloomberg option MID = "
+    "(BID + ASK) / 2 (missing BID = 0 when ASK exists). "
+    "PUT: MID / Strike; CALL: MID / current Bloomberg underlying price. "
+    "Multiply by 364 / calendar days to expiry × 100. "
+    "If CALL underlying price is unavailable, IRR is not shown."
 )
 _DAILY_BLOOMBERG_IRR_HEADER = (
     '<th>IRR <abbr class="dr-irr-info" title="'
@@ -2412,8 +2414,8 @@ def _daily_bloomberg_mid_lookup(snapshot):
     return lookup
 
 
-def _daily_bloomberg_irr_html(row, mid_lookup, today=None):
-    """Visual-only IRR; original current_mark/change/contribution stay intact."""
+def _daily_bloomberg_irr_html(row, mid_lookup, today=None, spot_lookup=None):
+    """Visual-only IRR; keep original current_mark/change/contribution intact."""
     irr = None
     if str(row.get("instrument_type") or "").upper() == "OPTION":
         try:
@@ -2426,8 +2428,18 @@ def _daily_bloomberg_irr_html(row, mid_lookup, today=None):
                 day = date.fromisoformat(day)
             dte = (date.fromisoformat(expiry) - day).days
             mid = mid_lookup.get((ticker, expiry, kind, strike))
-            if kind in ("P", "C") and strike > 0 and dte > 0 and mid is not None:
-                value = 100.0 * (mid / strike) * (364.0 / dte)
+            # Nirvana: PUT premium return is relative to strike collateral;
+            # CALL premium return is relative to the underlying share value.
+            denominator = strike if kind == "P" else None
+            if kind == "C" and spot_lookup is not None:
+                by_option, by_ticker = spot_lookup
+                denominator = by_option.get((ticker, expiry, kind, strike))
+                if denominator is None:
+                    denominator = by_ticker.get(ticker)
+            if (kind in ("P", "C") and denominator is not None
+                    and math.isfinite(denominator) and denominator > 0
+                    and dte > 0 and mid is not None):
+                value = 100.0 * (mid / denominator) * (364.0 / dte)
                 if math.isfinite(value):
                     irr = value
         except (TypeError, ValueError, OverflowError, ZeroDivisionError):
@@ -2566,22 +2578,24 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
         if key in seen:continue
         seen.add(key)
         result["total"]+=1
-        # v6.15.7.5: both PUT/CALL use Bloomberg option MID for the
-        # annualized premium return. A missing BID is treated as zero only
-        # when ASK is available (same fallback as Bloomberg Daily Return).
-        # Keep the IRR quote calculation separate from the Daily Return engine.
-        irr=None
-        premium=_strike_option_mid(row)
-        try:
-            dte=(date.fromisoformat(expiry)-date.fromisoformat(today)).days
-            if premium is not None and dte>0:
-                irr=100.0*(premium/strike)*(364.0/dte)
-        except (ValueError,TypeError,OverflowError,ZeroDivisionError):
-            pass
+        # v6.15.7.15: Keep Bloomberg MID for both sides, but apply Nirvana's
+        # denominator: PUT = Strike; CALL = validated Bloomberg underlying.
+        # No change to OOM, pricing, P&L, Delta, or collector data.
         spot=None
         try:spot=float(row.get("underlying_spot"))
         except (TypeError,ValueError,OverflowError):pass
         src=str(row.get("spot_source") or "")
+        valid_spot = (spot is not None and math.isfinite(spot)
+                      and spot > 0 and src in accepted_sources)
+        irr=None
+        premium=_strike_option_mid(row)
+        try:
+            dte=(date.fromisoformat(expiry)-date.fromisoformat(today)).days
+            denominator = strike if typ=="P" else (spot if valid_spot else None)
+            if premium is not None and denominator is not None and denominator>0 and dte>0:
+                irr=100.0*(premium/denominator)*(364.0/dte)
+        except (ValueError,TypeError,OverflowError,ZeroDivisionError):
+            pass
         if spot is None or not math.isfinite(spot) or spot<=0 or src not in accepted_sources:
             result["missing"]+=1
             # Missing Bloomberg price cannot be assumed far from strike.
@@ -2614,7 +2628,7 @@ def _strike_row_html(row, exposure_report=None):
     exposure_label=("—" if exposure is None else f"{exposure:.2f}%")
     irr=row.get("irr")
     irr_label="—" if irr is None else f"{irr:,.2f}%"
-    irr_title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); MID / Strike × 364 / calendar days to expiry."
+    irr_title="Annualized Premium Return (not true IRR): Bloomberg MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); PUT = MID / Strike, CALL = MID / Bloomberg underlying price; multiply by 364 / calendar days to expiry × 100."
     irr_html=(f'<span class="strike-irr strike-irr-green">{irr_label}</span>' if irr is not None and irr<=10.0 else f'<span class="strike-irr">{irr_label}</span>')
     return (f'<tr><td title="{irr_title}">{irr_html}</td><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
             f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
@@ -2645,7 +2659,7 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
                'No positions within 10% of strike or ITM.' if not full else
                'No positions with a valid Bloomberg price.')+'</td></tr>')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
-         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): PUT and CALL use Bloomberg option MID (BID + ASK) / 2; missing BID is zero when ASK exists. MID / Strike times 364 / days to expiry.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): Bloomberg MID (BID + ASK) / 2; missing BID is zero when ASK exists. PUT = MID / Strike; CALL = MID / Bloomberg underlying price. Multiply by 364 / days to expiry × 100.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
          +(''.join(_strike_row_html(r,exposure_report) for r in rows) if rows else message)
          +'</tbody></table></div>')
@@ -3228,7 +3242,7 @@ def opportunity_bloomberg_daily_return(request:Request):
         strike="" if r.get("strike") is None else f'{r["strike"]:g}';name=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"]);manual=r.get("bloomberg_manual_price");mv='' if manual is None else f'{float(manual):.4f}'
         mh=_daily_market_value_html(r)
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
-        rows+=f'<tr><td>{html.escape(name)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("baseline_price"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{mh}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{html.escape(r.get("effective_source") or "")}</td><td title="{html.escape(_DAILY_BLOOMBERG_IRR_TOOLTIP, quote=True)}">{_daily_bloomberg_irr_html(r, irr_mids)}</td><td>{_daily_bloomberg_oom_html(r, oom_spots)}</td></tr>'
+        rows+=f'<tr><td>{html.escape(name)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("baseline_price"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{mh}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{html.escape(r.get("effective_source") or "")}</td><td title="{html.escape(_DAILY_BLOOMBERG_IRR_TOOLTIP, quote=True)}">{_daily_bloomberg_irr_html(r, irr_mids, spot_lookup=oom_spots)}</td><td>{_daily_bloomberg_oom_html(r, oom_spots)}</td></tr>'
     status="FULL" if calc["complete"] else "PARTIAL";warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Bloomberg has not supplied a usable current mark for every Opportunity position.</div><br>'
     body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div><div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card daily-return-card">{_MARKET_VALUE_MOBILE_NOTE_HTML}<table class="daily-return-table daily-bloomberg"><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Change</th>{_MARKET_VALUE_HEADER_HTML}<th>Estimated P&amp;L</th><th>Effective Source</th>{_DAILY_BLOOMBERG_IRR_HEADER}{_DAILY_BLOOMBERG_OOM_HEADER}</tr></thead><tbody>{rows}</tbody></table></div>'''
     return page("Opportunity Bloomberg Daily Return",body,u,60 if auto_refresh_allowed() else None)
@@ -3895,7 +3909,7 @@ def bloomberg_daily_return_page(request:Request):
                f'<td>{prev_txt}</td><td>{bid_txt}</td><td>{ask_txt}</td><td>{market_txt}</td>'
                f'<td>{chg_txt}</td><td>{manual_html}</td><td>{pnl_txt}</td>'
                f'<td>{html.escape(str(r.get("effective_source") or ""))}</td>'
-               f'<td title="{html.escape(_DAILY_BLOOMBERG_IRR_TOOLTIP, quote=True)}">{_daily_bloomberg_irr_html(r, irr_mids)}</td><td>{_daily_bloomberg_oom_html(r, oom_spots)}</td></tr>')
+               f'<td title="{html.escape(_DAILY_BLOOMBERG_IRR_TOOLTIP, quote=True)}">{_daily_bloomberg_irr_html(r, irr_mids, spot_lookup=oom_spots)}</td><td>{_daily_bloomberg_oom_html(r, oom_spots)}</td></tr>')
 
     if not snap:
         status="WAITING"; status_class="bad"; feed_note="No Bloomberg Collector snapshot yet."
