@@ -2438,13 +2438,15 @@ def _daily_bloomberg_irr_html(row, mid_lookup, today=None):
 
 
 
-# v6.15.7.12: DISPLAY ONLY — Bloomberg Daily Return OOM after IRR.
+# v6.15.7.14: Use current Bloomberg underlying price as the OOM percentage
+# denominator in both Bloomberg Daily Return and Strike Proximity Monitor.
+# Keep each view's existing, separate color thresholds and all P&L/IRR logic.
 # Uses the SAME signed OTM distance/accepted underlying quote sources as the
 # existing Strike Proximity Monitor; the red/yellow color bands are distinct.
 # No Daily Return engine, collector, portfolio, export, or DB changes.
 _DAILY_BLOOMBERG_OOM_HEADER = (
-    '<th title="Signed distance from strike: PUT (underlying - strike) / strike; '
-    'CALL (strike - underlying) / strike. '
+    '<th title="Signed OOM distance as % of current Bloomberg underlying price: '
+    'PUT (underlying - strike) / underlying; CALL (strike - underlying) / underlying. '
     '5% and below: red. Above 5% to 10%: yellow. Above 10%: no highlight.">OOM</th>'
 )
 
@@ -2499,7 +2501,7 @@ def _daily_bloomberg_oom_html(row, spot_lookup):
             if spot is None:
                 spot = by_ticker.get(ticker)
             if kind in ("P", "C") and strike > 0 and spot is not None:
-                value = 100.0 * ((spot - strike) if kind == "P" else (strike - spot)) / strike
+                value = 100.0 * ((spot - strike) if kind == "P" else (strike - spot)) / spot
                 if math.isfinite(value):
                     distance = value
         except (TypeError, ValueError, OverflowError, ZeroDivisionError):
@@ -2587,8 +2589,8 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
                                        "qty":abs(qty),"strike":strike,"spot":None,"irr":irr,
                                        "distance":None,"source":src})
             continue
-        # Signed distance: OTM positive; ITM negative for BOTH puts and calls.
-        distance_pct=100*((spot-strike) if typ=="P" else (strike-spot))/strike
+        # Signed distance as % of current underlying: OTM positive, ITM negative for BOTH types.
+        distance_pct=100*((spot-strike) if typ=="P" else (strike-spot))/spot
         item={"ticker":ticker,"type":typ,"expiry":expiry,"qty":abs(qty),
               "strike":strike,"spot":spot,"irr":irr,"distance":distance_pct,"source":src}
         result["all_rows"].append(item)
