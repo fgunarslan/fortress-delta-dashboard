@@ -2063,6 +2063,10 @@ def _pdf_report_bytes(report):
     return bytes(output)
 
 
+# v6.15.7.17: FULL FUND EXPORT ONLY. This block is deliberately separate
+# from the Bloomberg/Yahoo daily-return, Delta, portfolio and strike engines.
+# No DB writes, new background jobs, HTTP calls or new dependencies.
+# The existing /export/{fund_key}/{fmt} routes and button HTML stay unchanged.
 def _fund_reports(fund_key):
     return [
         _collect_delta_export(fund_key),
@@ -2070,101 +2074,538 @@ def _fund_reports(fund_key):
         _collect_daily_export(fund_key,"yahoo"),
     ]
 
+
+def _full_option_id(label):
+    """Parse the established exported position label; never match ticker only."""
+    m=re.fullmatch(r"([A-Z0-9.\-]+)\s+(\d{4}-\d{2}-\d{2})\s+([PC])([0-9]+(?:\.[0-9]+)?)",str(label or "").strip().upper())
+    if not m:return None
+    try:return (m.group(1),m.group(2),m.group(3),round(float(m.group(4)),6))
+    except (TypeError,ValueError,OverflowError):return None
+
+
+def _full_bloomberg_view(report,snapshot):
+    """Format existing calculated rows; append READ-ONLY IRR/OOM for export.
+
+    Source calculations remain in the original Daily Return engine. Export's
+    two risk figures use exactly the same quote/spot/DTE helpers as the UI.
+    """
+    mids=_daily_bloomberg_mid_lookup(snapshot)
+    by_option,by_ticker=_daily_bloomberg_oom_lookup(snapshot)
+    rows=[]
+    for r in report["rows"]:
+        pos,qty,prev,bid,ask,market,mv,_effective,change,pnl,_contrib,source=r
+        irr=oom=None
+        key=_full_option_id(pos)
+        if key:
+            ticker,expiry,kind,strike=key
+            spot=by_option.get(key)
+            if spot is None:spot=by_ticker.get(ticker)
+            if spot is not None and math.isfinite(spot) and spot>0:
+                oom=(spot-strike)/spot if kind=="P" else (strike-spot)/spot
+                if not math.isfinite(oom):oom=None
+            mid=mids.get(key)
+            denominator=strike if kind=="P" else spot
+            try:
+                dte=_rpd_irr_days_to_expiry(expiry)
+                if (mid is not None and denominator is not None and denominator>0
+                        and dte is not None and dte>0):
+                    irr=(mid/denominator)*(364.0/dte)
+                    if not math.isfinite(irr):irr=None
+            except (TypeError,ValueError,OverflowError,ZeroDivisionError):
+                irr=None
+        rows.append([pos,qty,prev,bid,ask,market,change,mv,pnl,source,irr,oom])
+    return {
+        "title":report["title"],"summary":report["summary"],"rows":rows,
+        "headers":["Position","Qty","Previous Mark","Bloomberg Bid","Bloomberg Ask",
+                   "Bloomberg Market","Change","Market Value","Estimated P&L",
+                   "Effective Source","IRR","OOM"],
+        "formats":["text","integer","price","price","price","price","signed4",
+                   "currency2","currency2","text","percent2","percent2"],
+        "report_key":"bloomberg-daily-return",
+        "note":"Bloomberg MID is calculated without rounding; a missing BID with available ASK uses ASK / 2. "
+               "IRR: PUT MID / Strike, CALL MID / Bloomberg underlying; x364 / DTE. "
+               "Expiry-day DTE=1 only before the NY market close. "
+               "OOM is the signed distance to strike as a fraction of current Bloomberg underlying. "
+               "IRR and OOM are display-only and do not change Estimated P&L.",
+    }
+
+
+def _full_yahoo_view(report):
+    # The Yahoo Daily Return page does NOT have Bloomberg IRR/OOM columns.
+    # Preserve the existing source values and contribution calculations.
+    rows=[]
+    for r in report["rows"]:
+        pos,qty,prev,bid,ask,market,mv,_effective,change,pnl,contrib,source=r
+        rows.append([pos,qty,prev,bid,ask,market,change,mv,pnl,contrib,source])
+    return {
+        "title":report["title"],"summary":report["summary"],"rows":rows,
+        "headers":["Position","Qty","Previous Mark","Yahoo Bid","Yahoo Ask",
+                   "Yahoo Market","Change","Market Value","Estimated P&L",
+                   "Contribution","Effective Source"],
+        "formats":["text","integer","price","price","price","price","signed4",
+                   "currency2","currency2","percent4","text"],
+        "report_key":"yahoo-daily-return",
+        "note":"Yahoo marks can differ from Bloomberg and can be delayed or unavailable. "
+               "Market Value uses the unrounded source market price. "
+               "Source P&L and contribution figures are exported without recalculation.",
+    }
+
+
+def _full_strike_view(fund_key,snapshot,config_version,exposure_report):
+    strike=_strike_proximity_data(snapshot,config_version)
+    # Reproduce the OVERVIEW risk list (within 10% of strike or ITM).
+    rows=[]
+    for item in strike.get("rows",[]):
+        exposure=_strike_pdf_exposure_info(exposure_report,item)
+        rows.append([
+            item["ticker"],"Put" if item["type"]=="P" else "Call",item["expiry"],
+            abs(item["qty"]),item["strike"],item["spot"],
+            None if exposure is None else exposure/100.0,
+            None if item.get("irr") is None else item["irr"]/100.0,
+            None if item.get("distance") is None else item["distance"]/100.0,
+        ])
+    summary=[("Feed",strike.get("state") or "WAITING"),
+             ("Within 10% / ITM",len(rows)),
+             ("Active options",int(strike.get("total") or 0)),
+             ("Missing Bloomberg spots",int(strike.get("missing") or 0)),
+             ("Bloomberg snapshot",strike.get("source_date") or "-"),
+             ("Non-live exposure date",str((exposure_report or {}).get("report_date") or "Not uploaded"))]
+    return {
+        "title":("RPD Fortress Fund" if fund_key=="fortress" else "RPD Opportunity Fund")+" - Strike Proximity Monitor",
+        "summary":summary,"rows":rows,
+        "headers":["Ticker","Type","Expiration","Qty","Strike","Underlying Price",
+                   "Exposure (non-live)","IRR","OOM"],
+        "formats":["text","text","text","integer","price","price","percent2","percent2","percent2"],
+        "report_key":"strike",
+        "note":"Bloomberg options within 10% of strike or ITM only. "
+               "IRR: green if at/below 10%. Strike OOM colors: negative red, "
+               "0% to under 5% orange, 5% through 10% yellow. "
+               "Exposure comes from the last uploaded Nirvana PDF and is non-live.",
+    }
+
+
+def _full_export_payload(fund_key):
+    delta,bloomberg,yahoo=_fund_reports(fund_key)
+    with SessionLocal() as db:
+        if fund_key=="fortress":
+            snap,_=latest_snapshot(db)
+            cfg=int(get_setting(db,"config_version","1"))
+        else:
+            snap,_=_latest_opportunity_snapshot(db)
+            cfg=int(get_setting(db,"opportunity_config_version","1") or 1)
+        non_live=_get_strike_pdf_exposure(db,fund_key)
+    return {
+        "fund":fund_key,
+        "fund_name":"RPD Fortress Fund" if fund_key=="fortress" else "RPD Opportunity Fund",
+        "exported_at":datetime.now(ZoneInfo("America/New_York")),
+        "delta":delta,
+        "bloomberg":_full_bloomberg_view(bloomberg,snap),
+        "yahoo":_full_yahoo_view(yahoo),
+        "strike":_full_strike_view(fund_key,snap,cfg,non_live),
+    }
+
+
+def _full_summary_value(report,label,default=None):
+    return dict(report.get("summary") or []).get(label,default)
+
+
+def _full_summary_cards(payload):
+    d=payload["delta"]; b=payload["bloomberg"]; y=payload["yahoo"]
+    return [
+        ("Bloomberg Delta Exposure",_full_summary_value(d,"Delta Exposure %"),"percent3"),
+        ("Delta Exposure (USD)",_full_summary_value(d,"Delta Exposure $"),"currency0"),
+        ("Bloomberg Daily Return",_full_summary_value(b,"Estimated Daily Return"),"percent4"),
+        ("Bloomberg Estimated P&L",_full_summary_value(b,"Estimated P&L"),"currency2"),
+        ("Yahoo Daily Return",_full_summary_value(y,"Estimated Daily Return"),"percent4"),
+        ("Yahoo Estimated P&L",_full_summary_value(y,"Estimated P&L"),"currency2"),
+        ("Baseline NAV",_full_summary_value(b,"Baseline NAV"),"currency2"),
+        ("Strike alerts (<= 10% / ITM)",len(payload["strike"]["rows"]),"integer"),
+    ]
+
+
+def _full_fmt(value,fmt, *, signed=False):
+    if value is None:return "-"
+    if fmt=="text":return str(value)
+    try:
+        x=float(value)
+        if not math.isfinite(x):return "-"
+        if fmt=="integer":return f"{x:,.0f}"
+        if fmt=="price":return f"${x:,.4f}"
+        if fmt=="raw4":return f"{x:+.4f}"
+        if fmt=="signed4":return f"{x:+.4f}"
+        if fmt=="currency0":return f"{'-' if x<0 else ('+' if signed else '')}${abs(x):,.0f}"
+        if fmt=="currency2":return f"{'-' if x<0 else ('+' if signed else '')}${abs(x):,.2f}"
+        if fmt=="percent2":return f"{100*x:,.2f}%"
+        if fmt=="percent3":return f"{100*x:,.3f}%"
+        if fmt=="percent4":return f"{100*x:+.4f}%"
+        return f"{x:,.4f}"
+    except (TypeError,ValueError,OverflowError):return str(value)
+
+
+def _full_color_band(report_key,header,value):
+    """Color is for presentation only; never alters the numeric report data."""
+    if value is None:return None
+    try:
+        pct=round(float(value)*100,2)
+    except (TypeError,ValueError,OverflowError):return None
+    if not math.isfinite(pct):return None
+    if header=="IRR":return "green" if pct<=10 else None
+    if header!="OOM":return None
+    if report_key=="bloomberg-daily-return":
+        return "red" if pct<=5 else ("yellow" if pct<=10 else None)
+    if report_key=="strike":
+        return "red" if pct<0 else ("orange" if pct<5 else ("yellow" if pct<=10 else None))
+    return None
+
+
 def _xlsx_fund_report_bytes(fund_key):
-    reports=_fund_reports(fund_key)
+    """Five-sheet, styled FULL-FUND export. Reuses existing openpyxl dependency."""
     from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
     from openpyxl.utils import get_column_letter
-
-    wb=Workbook()
-    # remove default; create one sheet per report
-    default=wb.active
-    wb.remove(default)
-
-    sheet_names=[
-        "Bloomberg Delta",
-        "Bloomberg Daily Return",
-        "Yahoo Daily Return",
+    from openpyxl.worksheet.page import PageMargins
+    payload=_full_export_payload(fund_key)
+    wb=Workbook(); summary=wb.active;summary.title="Executive Summary"
+    navy="142C52";navy2="1D426B";blue="E9F3FF";white="FFFFFF";gray="697A93"
+    border="E2E8F0";soft="F4F7FB"
+    fills={"red":"FDE2E2","yellow":"FFF1BF","orange":"FFE5CC","green":"DCFCE7"}
+    def paint(ws,addr,value=None,bg=None,fg=navy,size=10,bold=False,align="left"):
+        c=ws[addr];c.value=value
+        if bg:c.fill=PatternFill("solid",fgColor=bg)
+        c.font=Font(name="Aptos",size=size,bold=bold,color=fg)
+        c.alignment=Alignment(horizontal=align,vertical="center",wrap_text=True)
+        return c
+    def fmt_cell(c,code):
+        mapping={
+            "integer":'#,##0;[Red]-#,##0',
+            "raw4":'+0.0000;-0.0000;0.0000',
+            "signed4":'+0.0000;-0.0000;0.0000',
+            "price":'$#,##0.0000;[Red]-$#,##0.0000',
+            "currency0":'$#,##0;[Red]-$#,##0',
+            "currency2":'$#,##0.00;[Red]-$#,##0.00',
+            "percent2":'0.00%;[Red]-0.00%',
+            "percent3":'0.000%;[Red]-0.000%',
+            "percent4":'+0.0000%;-0.0000%;0.0000%',
+        }
+        if code in mapping:c.number_format=mapping[code]
+    # Executive Summary: easy-to-scan live snapshot and source notes.
+    ws=summary;ws.sheet_view.showGridLines=False
+    ws.merge_cells("A1:L2");paint(ws,"A1",payload["fund_name"],navy,white,24,True)
+    ws.row_dimensions[1].height=26;ws.row_dimensions[2].height=20
+    ws.merge_cells("A3:L3")
+    paint(ws,"A3",f'FULL FUND MONITORING REPORT  |  Exported {payload["exported_at"].strftime("%d %b %Y, %I:%M %p")} New York',blue,navy2,11,True)
+    ws.row_dimensions[3].height=28
+    for i,(label,value,kind) in enumerate(_full_summary_cards(payload)):
+        row=5+(i//4)*4;col=1+(i%4)*3
+        a=get_column_letter(col);z=get_column_letter(col+2)
+        ws.merge_cells(f"{a}{row}:{z}{row}");ws.merge_cells(f"{a}{row+1}:{z}{row+2}")
+        paint(ws,f"{a}{row}",label,soft,gray,10,True)
+        cell=paint(ws,f"{a}{row+1}",value,blue,navy,20,True)
+        fmt_cell(cell,kind)
+        ws.row_dimensions[row].height=22
+        ws.row_dimensions[row+1].height=24;ws.row_dimensions[row+2].height=16
+    ws.merge_cells("A15:L15");paint(ws,"A15","DATA & METHODOLOGY",navy2,white,11,True)
+    notes=[
+        "Bloomberg and Yahoo are separate pricing sources. Values are estimated monitoring returns, not final NAV.",
+        "Bloomberg Daily Return includes Market Value, IRR and OOM. Yahoo Daily Return retains the source contribution.",
+        "CALL IRR uses Bloomberg underlying; PUT IRR uses strike; both use unrounded option MID and 364 / DTE.",
+        "On expiration day, IRR uses a DTE=1 display convention only until the NY market close.",
+        "OOM is measured against current Bloomberg underlying price. Daily Return and Strike Monitor use different colors.",
+        "Nirvana PDF Exposure in Strike Proximity is non-live and may be unavailable for some options.",
     ]
-    navy="17365D"; white="FFFFFF"; gray="667085"
-    thin=Side(style="thin",color="D9E1EA")
+    for n,note in enumerate(notes,17):
+        ws.merge_cells(start_row=n,start_column=1,end_row=n,end_column=12)
+        paint(ws,f"A{n}","•  "+note,None,navy2,10)
+        ws.row_dimensions[n].height=23
+    for col in range(1,13):ws.column_dimensions[get_column_letter(col)].width=13.5
+    ws.merge_cells("A25:L25");paint(ws,"A25","SOURCE METADATA",navy2,white,11,True)
+    metadata=[
+        ("Baseline report date",_full_summary_value(payload["bloomberg"],"Baseline Report Date","-")),
+        ("Baseline source file",_full_summary_value(payload["bloomberg"],"Baseline File","-")),
+        ("Bloomberg snapshot",_full_summary_value(payload["bloomberg"],"Snapshot (New York)","-")),
+        ("Yahoo snapshot",_full_summary_value(payload["yahoo"],"Snapshot (New York)","-")),
+        ("Collector",_full_summary_value(payload["delta"],"Collector","-")),
+        ("Nirvana Exposure PDF date",_full_summary_value(payload["strike"],"Non-live exposure date","-")),
+    ]
+    for i,(label,value) in enumerate(metadata,26):
+        ws.merge_cells(start_row=i,start_column=1,end_row=i,end_column=3)
+        ws.merge_cells(start_row=i,start_column=4,end_row=i,end_column=12)
+        paint(ws,f"A{i}",label,soft,gray,10,True)
+        paint(ws,f"D{i}",str(value),soft,navy,10)
+        ws.row_dimensions[i].height=22
+    ws.freeze_panes="A4";ws.sheet_properties.pageSetUpPr.fitToPage=True
+    ws.page_setup.orientation="landscape";ws.page_setup.fitToWidth=1
+    # Detailed tabular sheets; values remain numeric/filterable.
+    specs=[("Bloomberg Delta",payload["delta"]),("Bloomberg Daily Return",payload["bloomberg"]),
+           ("Yahoo Daily Return",payload["yahoo"]),("Strike Proximity",payload["strike"])]
+    for sheet_name,report in specs:
+        ws=wb.create_sheet(sheet_name);ws.sheet_view.showGridLines=False
+        headers=report["headers"];fmts=report["formats"];n=len(headers)
+        span=max(n,12)
+        ws.merge_cells(start_row=1,start_column=1,end_row=2,end_column=span)
+        paint(ws,"A1",report["title"],navy,white,19,True)
+        ws.row_dimensions[1].height=26;ws.row_dimensions[2].height=17
+        ws.merge_cells(start_row=3,start_column=1,end_row=3,end_column=span)
+        paint(ws,"A3",f'FULL FUND REPORT  •  {payload["exported_at"].strftime("%d %b %Y  %I:%M %p")} NY',blue,navy2,10,True)
+        ws.row_dimensions[3].height=25
+        for i,(label,value) in enumerate(report.get("summary",[])):
+            r=5+i//3;c=1+(i%3)*4
+            ws.cell(r,c,label);ws.cell(r,c).font=Font(name="Aptos",size=9,color=gray,bold=True)
+            v=ws.cell(r,c+1,value);v.font=Font(name="Aptos",size=10,color=navy,bold=True)
+            if label.endswith("%") or label=="Estimated Daily Return":fmt_cell(v,"percent4")
+            elif "$" in label or label in ("Estimated P&L","Baseline NAV"):fmt_cell(v,"currency2")
+            ws.row_dimensions[r].height=22
+        header_row=max(11,6+(len(report.get("summary",[]))+2)//3+1)
+        for j,heading in enumerate(headers,1):
+            c=ws.cell(header_row,j,heading)
+            c.fill=PatternFill("solid",fgColor=navy2)
+            c.font=Font(name="Aptos",size=10,color=white,bold=True)
+            c.alignment=Alignment(vertical="center",horizontal="center",wrap_text=True)
+        ws.row_dimensions[header_row].height=34
+        for index,row in enumerate(report["rows"]):
+            ri=header_row+1+index
+            for j,value in enumerate(row,1):
+                c=ws.cell(ri,j,value)
+                c.fill=PatternFill("solid",fgColor=(white if index%2==0 else soft))
+                c.font=Font(name="Aptos",size=10,color=navy)
+                c.alignment=Alignment(vertical="center",horizontal="left" if j==1 else "right")
+                c.border=Border(bottom=Side(style="hair",color=border))
+                fmt_cell(c,fmts[j-1])
+                band=_full_color_band(report.get("report_key"),headers[j-1],value)
+                if band:
+                    c.fill=PatternFill("solid",fgColor=fills[band])
+                    c.font=Font(name="Aptos",size=10,bold=True,color="9B1C1C" if band=="red" else navy)
+            ws.row_dimensions[ri].height=22
+        end=max(header_row+1,header_row+len(report["rows"]))
+        ws.auto_filter.ref=f"A{header_row}:{get_column_letter(n)}{end}"
+        ws.freeze_panes=f"C{header_row+1}"
+        for i,h in enumerate(headers,1):
+            width=33 if h=="Position" else (25 if h=="Effective Source" else (24 if h in ("Exposure (non-live)","Bloomberg snapshot") else 17))
+            ws.column_dimensions[get_column_letter(i)].width=width
+        ws.sheet_properties.pageSetUpPr.fitToPage=True;ws.page_setup.orientation="landscape";ws.page_setup.fitToWidth=1
+        ws.print_title_rows=f"1:{header_row}"
+        ws.page_margins=PageMargins(left=.28,right=.28,top=.45,bottom=.45,header=.17,footer=.17)
+        ws.oddFooter.center.text="RPD | Internal monitoring report";ws.oddFooter.right.text="Page &P / &N"
+        note=report.get("note")
+        if note:
+            rownum=end+3
+            ws.merge_cells(start_row=rownum,start_column=1,end_row=rownum,end_column=n)
+            c=paint(ws,f"A{rownum}",note,soft,gray,9)
+            ws.row_dimensions[rownum].height=40
+    out=BytesIO();wb.save(out);return out.getvalue()
 
-    for report,sheet_name in zip(reports,sheet_names):
-        ws=wb.create_sheet(title=sheet_name)
-        ncols=max(4,len(report["headers"]))
-        ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=ncols)
-        c=ws.cell(1,1,report["title"])
-        c.font=Font(size=16,bold=True,color=navy)
-        ws.row_dimensions[1].height=26
 
-        ny_now=datetime.now(ZoneInfo("America/New_York"))
-        ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=ncols)
-        c=ws.cell(2,1,f'Exported: {ny_now.strftime("%Y-%m-%d %I:%M:%S %p")} New York')
-        c.font=Font(size=9,color=gray)
+def _pdf_full_fund_bytes(payload):
+    """Readable, five-section vector PDF using only Python's standard library.
 
-        row=4
-        for label,value in report["summary"]:
-            ws.cell(row,1,label).font=Font(bold=True,color=navy)
-            ws.cell(row,2,value)
-            if label.endswith("%") or label=="Estimated Daily Return":
-                ws.cell(row,2).number_format="0.0000%"
-            elif "$" in label or label in ("Estimated P&L","Baseline NAV"):
-                ws.cell(row,2).number_format='$#,##0.00;[Red]-$#,##0.00'
-            row+=1
+    No ReportLab/HTML renderer dependency is required on the Render server.
+    """
+    W,H=1190.0,842.0  # A3 landscape, supports all detailed columns legibly.
+    L,R=44.0,W-44.0;CW=R-L
+    navy=(.073,.157,.294); navy2=(.102,.239,.412); gray=(.416,.490,.584)
+    white=(1.,1.,1.);bg=(.973,.982,.994);stroke=(.877,.912,.957)
+    pale=(.925,.957,1.);green=(.855,.981,.904);red=(1.,.872,.872)
+    yellow=(1.,.945,.748);orange=(1.,.896,.796)
+    def esc(x):return _pdf_safe_text(str(x))
+    def rgb(c):return f"{c[0]:.3f} {c[1]:.3f} {c[2]:.3f}"
+    def rect(x,y,w,h,fill,radius=0):
+        return f"{rgb(fill)} rg {x:.2f} {y:.2f} {w:.2f} {h:.2f} re f\n"
+    def line(x,y,x2,y2,color=stroke,width=.5):
+        return f"{rgb(color)} RG {width:.2f} w {x:.2f} {y:.2f} m {x2:.2f} {y2:.2f} l S\n"
+    def text(x,y,value,size=10,bold=False,color=navy):
+        font="/F2" if bold else "/F1"
+        return f"{rgb(color)} rg BT {font} {size:.2f} Tf 1 0 0 1 {x:.2f} {y:.2f} Tm ({esc(value)}) Tj ET\n"
+    def short(v,width,size=10):
+        s=str(v)
+        # Conservative Helvetica estimate to avoid truncated headings/cells.
+        maxc=max(2,int(width/(size*.57)))
+        return s if len(s)<=maxc else s[:maxc-2]+".."
+    def righttext(right,y,value,size=10,bold=False,color=navy):
+        s=str(value);w=len(s)*size*.50
+        return text(right-w,y,s,size,bold,color)
+    def base(title,kicker):
+        c=rect(0,0,W,H,white)
+        c+=rect(0,H-84,W,84,navy)
+        c+=rect(L,H-50,5,27,(.87,.70,.24))
+        c+=text(L+20,H-47,"RPD  /  "+payload["fund_name"],21,True,white)
+        c+=righttext(R,H-38,"FULL FUND MONITORING REPORT",10,True,(.79,.87,.98))
+        c+=text(L,H-116,title,22,True,navy)
+        c+=text(L,H-137,kicker,10,False,gray)
+        c+=line(L,H-150,R,H-150)
+        return c
+    def footer(index,total):
+        c=line(L,36,R,36)
+        c+=text(L,19,"RPD FUND MANAGEMENT   |   INTERNAL MONITORING   |   New York time",8,False,gray)
+        c+=righttext(R,19,f"{index} / {total}",8,True,navy2)
+        return c
+    def pill(x,y,w,h,title,value,code,accent=None):
+        c=rect(x,y,w,h,bg);c+=rect(x,y,w,2,stroke)
+        if accent:c+=rect(x,y,4,h,accent)
+        c+=text(x+14,y+h-21,short(title,w-26,9.4),9.4,True,gray)
+        val=_full_fmt(value,code)
+        c+=text(x+14,y+20,short(val,w-24,17),17,True,navy)
+        return c
+    pages=[]
+    exported=payload["exported_at"].strftime("%d %b %Y, %I:%M:%S %p")
+    # 01 executive summary
+    c=base("Executive overview",f"Report generated {exported}  |  Bloomberg and Yahoo source snapshots")
+    cards=_full_summary_cards(payload);gap=13;w=(CW-3*gap)/4
+    for idx,(name,value,fmt) in enumerate(cards):
+        x=L+(idx%4)*(w+gap);y=H-255-(idx//4)*104
+        accent=(.07,.61,.40) if idx in (2,4) else ((.25,.49,.86) if idx%2 else (.50,.38,.87))
+        c+=pill(x,y,w,92,name,value,fmt,accent)
+    c+=rect(L,330,CW,132,bg)
+    c+=text(L+17,435,"SOURCE METADATA",12,True,navy2)
+    metadata=[
+        ("Baseline report",_full_summary_value(payload["bloomberg"],"Baseline Report Date","-")),
+        ("Source file",_full_summary_value(payload["bloomberg"],"Baseline File","-")),
+        ("Bloomberg snapshot",_full_summary_value(payload["bloomberg"],"Snapshot (New York)","-")),
+        ("Yahoo snapshot",_full_summary_value(payload["yahoo"],"Snapshot (New York)","-")),
+        ("Collector",_full_summary_value(payload["delta"],"Collector","-")),
+        ("Nirvana Exposure PDF date",_full_summary_value(payload["strike"],"Non-live exposure date","-")),
+    ]
+    for i,(label,value) in enumerate(metadata):
+        col=i%2;row=i//2
+        x=L+17+col*CW/2;y=405-row*31
+        c+=text(x,y,label,8.5,True,gray)
+        c+=text(x+158,y,short(value,CW/2-185,9.5),9.5,False,navy)
+    c+=rect(L,190,CW,130,bg)
+    c+=text(L+17,292,"REPORT COVERAGE",12,True,navy2)
+    items=[
+      ("Bloomberg Delta",_full_summary_value(payload["delta"],"Coverage","-")),
+      ("Bloomberg Daily Return",_full_summary_value(payload["bloomberg"],"Coverage","-")),
+      ("Yahoo Daily Return",_full_summary_value(payload["yahoo"],"Coverage","-")),
+      ("Strike alerts",str(len(payload["strike"]["rows"]))),
+    ]
+    for i,(label,value) in enumerate(items):
+        x=L+18+i*(CW-35)/4
+        c+=text(x,254,label,10,True,gray)
+        c+=text(x,224,str(value),16,True,navy)
+    c+=text(L,159,"READING THIS REPORT",11,True,navy2)
+    c+=text(L,137,"Bloomberg and Yahoo returns are separate live/delayed estimates; neither is a final fund NAV.",10,False,gray)
+    c+=text(L,116,"Unrounded market prices drive Market Value. Bloomberg IRR/OOM are read-only risk indicators.",10,False,gray)
+    c+=text(L,95,"Strike Proximity lists options within 10% of strike or in-the-money. Non-live exposure is from Nirvana PDF.",10,False,gray)
+    pages.append(c)
+    specs=[("02",payload["delta"],"Bloomberg collector | portfolio Delta and exposure"),
+           ("03",payload["bloomberg"],"Bloomberg MID and estimated P&L | IRR / OOM risk signals"),
+           ("04",payload["yahoo"],"Yahoo marks and estimated P&L | separate source from Bloomberg"),
+           ("05",payload["strike"],"Bloomberg only | options within 10% of strike or ITM")]
+    widths_by_key={
+      "delta":[2.35,.75,1.15,1.35,.86,1.7,1.4],
+      "bloomberg-daily-return":[2.3,.79,1.0,.88,.88,.99,.75,1.53,1.50,1.60,.72,.70],
+      "yahoo-daily-return":[2.38,.82,1.08,.90,.90,1.0,.82,1.54,1.56,1.0,1.54],
+      "strike":[1.24,.75,1.36,.95,1.07,1.36,1.35,.95,.95],
+    }
+    short_headers={"Bloomberg Delta":"Delta", "Underlying Price":"Underlying",
+       "Delta Exposure $":"Delta Exp. ($)","Contribution % NAV":"NAV Contr.",
+       "Previous Mark":"Previous", "Bloomberg Bid":"BBG Bid", "Bloomberg Ask":"BBG Ask",
+       "Bloomberg Market":"BBG Market","Yahoo Bid":"Yahoo Bid", "Yahoo Ask":"Yahoo Ask",
+       "Yahoo Market":"Yahoo Market", "Estimated P&L":"Est. P&L", "Effective Source":"Source",
+       "Market Value":"Market Value","Exposure (non-live)":"Exposure*", "Contribution":"Contribution",
+    }
+    for code,report,kicker in specs:
+        rows=report["rows"];headers=report["headers"];fmts=report["formats"]
+        weights=widths_by_key.get(report["report_key"],[1]*len(headers))
+        scales=[CW*a/sum(weights) for a in weights]
+        # Keep repeated headers and a restrained summary ribbon on subsequent pages.
+        chunk=24
+        row_groups=[rows[i:i+chunk] for i in range(0,len(rows),chunk)] or [[]]
+        for k,group in enumerate(row_groups):
+            title=report["title"].split(" - ",1)[-1]
+            if k:title+="  (continued)"
+            c=base(f"{code}  /  {title}",f"Exported {exported} New York  |  {kicker}")
+            summary=list(report.get("summary",[]))
+            # Compact metadata line: preserve raw source summaries as context.
+            if report["report_key"] in ("bloomberg-daily-return","yahoo-daily-return"):
+                wanted={"Status","Estimated Daily Return","Estimated P&L","Baseline NAV","Baseline Report Date","Coverage"}
+                displayed=[item for item in summary if item[0] in wanted] if k==0 else summary[:3]
+            else:
+                displayed=summary[:6] if k==0 else summary[:3]
+            ribbon_y=H-219
+            c+=rect(L,ribbon_y,CW,62,bg)
+            n=len(displayed);step=CW/max(1,n)
+            for i,(label,value) in enumerate(displayed):
+                x=L+12+i*step
+                fmt=("percent4" if label=="Estimated Daily Return" else
+                     "percent3" if label.endswith("%") else
+                     "currency2" if label in ("Estimated P&L","Baseline NAV","Delta Exposure $") else
+                     "integer" if isinstance(value,int) else "text")
+                c+=text(x,ribbon_y+39,short(label,step-16,9),9,True,gray)
+                c+=text(x,ribbon_y+14,short(_full_fmt(value,fmt),step-18,12.2),12.2,True,navy)
+            # Header and detail. No header truncation is permitted for key fields.
+            header_y=H-274
+            c+=rect(L,header_y-28,CW,31,navy2)
+            x=L
+            for j,(header,width) in enumerate(zip(headers,scales)):
+                label=short_headers.get(header,header)
+                hsize=8.9 if len(headers)<11 else 8.5
+                # numeric cells right-aligned, position / source left-aligned
+                if j==0 or header in ("Ticker","Type","Expiration","Effective Source"):
+                    c+=text(x+7,header_y-16,short(label,width-12,hsize),hsize,True,white)
+                else:
+                    c+=righttext(x+width-7,header_y-16,short(label,width-12,hsize),hsize,True,white)
+                x+=width
+            rowheight=18.2
+            table_top=header_y-29
+            if not group:
+                c+=text(L+11,table_top-35,"No matching monitored positions are available for this snapshot.",11,False,gray)
+            for i,row in enumerate(group):
+                y=table_top-(i+1)*rowheight
+                if i%2:c+=rect(L,y,CW,rowheight,bg)
+                x=L
+                for j,(value,width) in enumerate(zip(row,scales)):
+                    f=fmts[j];sval=_full_fmt(value,f)
+                    hdr=headers[j]
+                    band=_full_color_band(report["report_key"],hdr,value)
+                    if band:
+                        col={"red":red,"yellow":yellow,"orange":orange,"green":green}[band]
+                        c+=rect(x+2,y+2,width-4,rowheight-4,col)
+                    color=(.66,.15,.15) if band=="red" else navy
+                    if value is None:color=gray
+                    is_label=(j==0 or hdr in ("Ticker","Type","Expiration","Effective Source"))
+                    fsize=8.65 if len(headers)>=11 else 9.3
+                    sval=short(sval,width-14,fsize)
+                    if is_label:c+=text(x+7,y+6,sval,fsize,band is not None,color)
+                    else:c+=righttext(x+width-7,y+6,sval,fsize,band is not None,color)
+                    x+=width
+                c+=line(L,y,R,y,stroke,.27)
+            # Section details and conventions, matched to the UI and the collector.
+            note=report.get("note")
+            if not note and report["report_key"]=="delta":
+                note="Delta exposures are sourced from Bloomberg collector positions and current portfolio configuration."
+            if note:
+                y0=max(58,table_top-(len(group)+1)*rowheight-21)
+                # Two-line manual word wrap ensures PDF text remains in page width.
+                maxc=177
+                words=str(note).split();lines=[];linebuf=""
+                for word in words:
+                    if len(linebuf)+len(word)+1>maxc:
+                        lines.append(linebuf);linebuf=word
+                    else:linebuf=(linebuf+" "+word).strip()
+                if linebuf:lines.append(linebuf)
+                for n,ln in enumerate(lines[:2]):
+                    c+=text(L,y0-14*n,ln,8.25,False,gray)
+            pages.append(c)
+    contents=[(page+footer(i+1,len(pages))).encode("latin-1","replace") for i,page in enumerate(pages)]
+    objects=[b"<< /Type /Catalog /Pages 2 0 R >>",b"",
+             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"]
+    ids=[]
+    for content in contents:
+        pid=len(objects)+1;cid=pid+1;ids.append(pid)
+        objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {W:.0f} {H:.0f}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {cid} 0 R >>".encode())
+        objects.append(b"<< /Length "+str(len(content)).encode()+b" >>\nstream\n"+content+b"\nendstream")
+    objects[1]=f'<< /Type /Pages /Kids [{" ".join(str(pid)+" 0 R" for pid in ids)}] /Count {len(ids)} >>'.encode()
+    out=bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");offsets=[0]
+    for i,obj in enumerate(objects,1):
+        offsets.append(len(out));out.extend(f"{i} 0 obj\n".encode());out.extend(obj);out.extend(b"\nendobj\n")
+    xref=len(out);out.extend(f"xref\n0 {len(objects)+1}\n".encode());out.extend(b"0000000000 65535 f \n")
+    for pos in offsets[1:]:out.extend(f"{pos:010d} 00000 n \n".encode())
+    out.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(out)
 
-        row+=1
-        header_row=row
-        for col,h in enumerate(report["headers"],1):
-            cell=ws.cell(row,col,h)
-            cell.fill=PatternFill("solid",fgColor=navy)
-            cell.font=Font(bold=True,color=white)
-            cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
-            cell.border=Border(bottom=thin)
-        ws.row_dimensions[row].height=28
-
-        for data in report["rows"]:
-            row+=1
-            for col,val in enumerate(data,1):
-                cell=ws.cell(row,col,val)
-                cell.border=Border(bottom=thin)
-                fmt=report["formats"][col-1]
-                if fmt=="integer": cell.number_format='#,##0;[Red]-#,##0'
-                elif fmt=="currency0": cell.number_format='$#,##0;[Red]-$#,##0'
-                elif fmt=="currency2": cell.number_format='$#,##0.00;[Red]-$#,##0.00'
-                elif fmt=="price": cell.number_format='$0.0000'
-                elif fmt=="percent3": cell.number_format='0.000%'
-                elif fmt=="percent4": cell.number_format='0.0000%'
-            if row%2==0:
-                for col in range(1,ncols+1):
-                    ws.cell(row,col).fill=PatternFill("solid",fgColor="F8FAFC")
-
-        widths=[32,12,16,14,14,16,16,16,14,18,16,22]
-        for i in range(1,ncols+1):
-            ws.column_dimensions[get_column_letter(i)].width=widths[i-1] if i<=len(widths) else 16
-
-        ws.freeze_panes=ws.cell(header_row+1,1)
-        ws.auto_filter.ref=f"A{header_row}:{get_column_letter(ncols)}{row}"
-        ws.sheet_view.showGridLines=False
-        ws.page_setup.orientation="landscape"
-        ws.page_setup.fitToWidth=1
-        ws.sheet_properties.pageSetUpPr.fitToPage=True
-
-    bio=BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
 
 def _pdf_fund_report_bytes(fund_key):
-    # Reuse the already-tested per-report PDF generator and merge the
-    # three sections into one PDF document.
-    reports=_fund_reports(fund_key)
-    writer=PdfWriter()
-    for report in reports:
-        part=_pdf_report_bytes(report)
-        reader=PdfReader(BytesIO(part))
-        for page in reader.pages:
-            writer.add_page(page)
-    bio=BytesIO()
-    writer.write(bio)
-    return bio.getvalue()
+    return _pdf_full_fund_bytes(_full_export_payload(fund_key))
 
 def _fund_export_buttons(fund_key):
     return (
@@ -2376,6 +2817,35 @@ def _strike_option_mid(row):
 
 
 
+# v6.15.7.16: For IRR DISPLAY ONLY, treat an option expiring today as
+# DTE=1 through the applicable New York cash-equity market close.
+# After that close, or for already-expired options, IRR is unavailable.
+# Positive calendar-day DTE, option marks, P&L and all other calculations
+# remain unchanged. A one-day floor is a display convention, NOT real DTE.
+def _rpd_irr_days_to_expiry(expiry, *, as_of=None, now_ny=None):
+    ny_now = now_ny if now_ny is not None else _ny_now()
+    if ny_now.tzinfo is None:
+        raise ValueError("IRR expiry check requires a timezone-aware datetime")
+    ny_now = ny_now.astimezone(ZoneInfo("America/New_York"))
+    day = as_of if as_of is not None else ny_now.date()
+    if isinstance(day, str):
+        day = date.fromisoformat(day)
+    expiry_day = date.fromisoformat(expiry) if isinstance(expiry, str) else expiry
+    remaining = (expiry_day - day).days
+    if remaining > 0:
+        return remaining
+    if remaining < 0 or day != ny_now.date() or _rpd_nyse_closed_day(day):
+        return None
+    # Mirror the existing Yahoo market-hours calendar's early-close dates;
+    # NYSE closes at 13:00 ET on these days, normally 16:00 ET otherwise.
+    thanksgiving = _rpd_nth_weekday(day.year, 11, 3, 4)
+    early_close = (day == thanksgiving + timedelta(days=1)
+                   or (day.month == 12 and day.day == 24)
+                   or (day.month == 7 and day.day == 3 and day.weekday() < 5))
+    close_hour = 13 if early_close else 16
+    return 1 if (ny_now.hour, ny_now.minute, ny_now.second) < (close_hour, 0, 0) else None
+
+
 # v6.15.7.15: Display-only Bloomberg Daily Return IRR. Match Nirvana's
 # annualized premium return denominator: PUT = Strike, CALL = Bloomberg
 # underlying spot. Read only validated quotes; never change Daily Return P&L.
@@ -2384,6 +2854,8 @@ _DAILY_BLOOMBERG_IRR_TOOLTIP = (
     "(BID + ASK) / 2 (missing BID = 0 when ASK exists). "
     "PUT: MID / Strike; CALL: MID / current Bloomberg underlying price. "
     "Multiply by 364 / calendar days to expiry × 100. "
+    "On expiration day before the New York market close, use DTE = 1 "
+    "(a display convention); at or after market close, IRR is unavailable. "
     "If CALL underlying price is unavailable, IRR is not shown."
 )
 _DAILY_BLOOMBERG_IRR_HEADER = (
@@ -2423,10 +2895,7 @@ def _daily_bloomberg_irr_html(row, mid_lookup, today=None, spot_lookup=None):
             expiry = str(row.get("expiry") or "")
             kind = str(row.get("option_type") or "").upper().strip()[:1]
             strike = round(float(row.get("strike")), 6)
-            day = today or _ny_now().date()
-            if isinstance(day, str):
-                day = date.fromisoformat(day)
-            dte = (date.fromisoformat(expiry) - day).days
+            dte = _rpd_irr_days_to_expiry(expiry, as_of=today)
             mid = mid_lookup.get((ticker, expiry, kind, strike))
             # Nirvana: PUT premium return is relative to strike collateral;
             # CALL premium return is relative to the underlying share value.
@@ -2438,7 +2907,7 @@ def _daily_bloomberg_irr_html(row, mid_lookup, today=None, spot_lookup=None):
                     denominator = by_ticker.get(ticker)
             if (kind in ("P", "C") and denominator is not None
                     and math.isfinite(denominator) and denominator > 0
-                    and dte > 0 and mid is not None):
+                    and dte is not None and mid is not None):
                 value = 100.0 * (mid / denominator) * (364.0 / dte)
                 if math.isfinite(value):
                     irr = value
@@ -2590,9 +3059,9 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
         irr=None
         premium=_strike_option_mid(row)
         try:
-            dte=(date.fromisoformat(expiry)-date.fromisoformat(today)).days
+            dte=_rpd_irr_days_to_expiry(expiry, as_of=today)
             denominator = strike if typ=="P" else (spot if valid_spot else None)
-            if premium is not None and denominator is not None and denominator>0 and dte>0:
+            if premium is not None and denominator is not None and denominator>0 and dte is not None:
                 irr=100.0*(premium/denominator)*(364.0/dte)
         except (ValueError,TypeError,OverflowError,ZeroDivisionError):
             pass
@@ -2628,7 +3097,7 @@ def _strike_row_html(row, exposure_report=None):
     exposure_label=("—" if exposure is None else f"{exposure:.2f}%")
     irr=row.get("irr")
     irr_label="—" if irr is None else f"{irr:,.2f}%"
-    irr_title="Annualized Premium Return (not true IRR): Bloomberg MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); PUT = MID / Strike, CALL = MID / Bloomberg underlying price; multiply by 364 / calendar days to expiry × 100."
+    irr_title="Annualized Premium Return (not true IRR): Bloomberg MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); PUT = MID / Strike, CALL = MID / Bloomberg underlying price; multiply by 364 / calendar days to expiry × 100. On expiration day IRR uses DTE=1 until NY market close, then shows —."
     irr_html=(f'<span class="strike-irr strike-irr-green">{irr_label}</span>' if irr is not None and irr<=10.0 else f'<span class="strike-irr">{irr_label}</span>')
     return (f'<tr><td title="{irr_title}">{irr_html}</td><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
             f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
@@ -2659,7 +3128,7 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
                'No positions within 10% of strike or ITM.' if not full else
                'No positions with a valid Bloomberg price.')+'</td></tr>')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
-         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): Bloomberg MID (BID + ASK) / 2; missing BID is zero when ASK exists. PUT = MID / Strike; CALL = MID / Bloomberg underlying price. Multiply by 364 / days to expiry × 100.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): Bloomberg MID (BID + ASK) / 2; missing BID is zero when ASK exists. PUT = MID / Strike; CALL = MID / Bloomberg underlying price. Multiply by 364 / days to expiry × 100. On expiration day IRR uses DTE=1 until NY market close, then shows —.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
          +(''.join(_strike_row_html(r,exposure_report) for r in rows) if rows else message)
          +'</tbody></table></div>')
