@@ -3472,11 +3472,45 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None, live_e
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
          +(''.join(_strike_row_html(r,exposure_report,live_est) for r in rows) if rows else empty)
          +equiv+'</tbody></table></div>')
-    totals=_strike_exposure_total_cards(exposure_report,live_est) if full else ''
-    return f'<div class="summarypanel strike-panel">{header}{meta}{totals}{warning}{tab}</div>'
+    # v6.15.7.19.1 UI-only: on the FULL list keep both small totals to
+    # the RIGHT of the monitor heading, rather than adding a second row.
+    # The Overview never displays total cards.
+    if full:
+        totals=_strike_exposure_total_cards(exposure_report,live_est)
+        heading=(f'<div class="strike-full-heading">'
+                 f'<div class="strike-heading-left">{header}{meta}</div>'
+                 f'{totals}</div>')
+    else:
+        heading=header+meta
+    return f'<div class="summarypanel strike-panel">{heading}{warning}{tab}</div>'
 
 
 STRIKE_MONITOR_CSS="""
+/* v6.15.7.19.1: Prevent the wider Strike table from forcing a 930px
+   intrinsic column inside each half of the Overview. Tables scroll INSIDE
+   their fund cards; the two funds can never paint on top of each other. */
+.funds>.fundcol{grid-template-columns:minmax(0,1fr);width:100%;max-width:100%;min-width:0;box-sizing:border-box}
+.funds>.fundcol>.fundtitle,.funds>.fundcol>.summarypanel{width:100%;max-width:100%;min-width:0;box-sizing:border-box}
+.funds .strike-panel .strike-table-scroll{width:100%;max-width:100%;min-width:0;overflow-x:auto;-webkit-overflow-scrolling:touch}
+/* Only the existing Strike Monitor is styled by these rules; the
+   full-list page did not inherit Overview's header/badge flex styles. */
+.strike-panel .panelhead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px;min-width:0}
+.strike-panel .headgroup{display:flex;flex-wrap:wrap;align-items:center;gap:9px;min-width:0}
+.strike-panel .panelhead h3{margin:0;font-size:19px}
+.strike-panel .headgroup .delay-badge{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;background:#eef3fb;color:#2d4771;border:1px solid #dde7f5}
+.strike-panel .panelhead a{font-size:13px;white-space:nowrap}
+/* The TOTALS belong to the right of the existing full-list heading.
+   No extra KPI row, no changes to the Overview, and no altered data. */
+.strike-full-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 9px;min-width:0}
+.strike-full-heading .strike-heading-left{flex:1 1 auto;min-width:0}
+.strike-full-heading .strike-heading-left .strike-meta{margin-bottom:0}
+.strike-full-heading .strike-exposure-totals{display:flex;flex:0 0 auto;align-items:stretch;flex-wrap:nowrap;gap:10px;margin:0}
+.strike-full-heading .strike-total-box{box-sizing:border-box;width:208px;min-width:0;min-height:69px;padding:8px 12px;justify-content:center}
+.strike-full-heading .strike-total-box span{white-space:nowrap;font-size:11px}
+.strike-full-heading .strike-total-box strong{font-size:20px;line-height:1.1}
+.strike-full-heading .strike-total-box small{font-size:10px;line-height:1.2}
+@media(max-width:1030px){.strike-full-heading{flex-wrap:wrap}.strike-full-heading .strike-exposure-totals{flex-wrap:wrap;max-width:100%}}
+@media(max-width:490px){.strike-full-heading .strike-exposure-totals{width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.strike-full-heading .strike-total-box{width:100%;min-width:0}.strike-full-heading .strike-total-box span{white-space:normal}}
 .strike-panel{min-height:0;gap:0}
 .strike-panel .panelhead{margin-bottom:4px}
 .strike-meta{font-size:10.5px;color:#64748b;margin-bottom:6px}
