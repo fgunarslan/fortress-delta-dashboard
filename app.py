@@ -3482,7 +3482,7 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None, live_e
                  f'{totals}</div>')
     else:
         heading=header+meta
-    return f'<div class="summarypanel strike-panel">{heading}{warning}{tab}</div>'
+    return f'<div class="summarypanel strike-panel{" strike-full-page" if full else ""}">{heading}{warning}{tab}</div>'
 
 
 STRIKE_MONITOR_CSS="""
@@ -3567,6 +3567,21 @@ STRIKE_MONITOR_CSS="""
   .funds .strike-panel .strike-distance{display:inline-block;box-sizing:border-box;min-width:0;width:100%;max-width:100%;padding:5px 1px;font-size:inherit;white-space:nowrap}
   .funds .strike-panel .strike-exposure-info{font-size:10px}
 }
+/* v6.15.7.19.3: Full-list page ONLY. The Overview provides a white
+   .summarypanel through its own page CSS; the standalone full-list page
+   did not, leaving its entire table on the gray page background.
+   Restore the same white card/table surface for both funds, without touching
+   any table values, calculations, position status, alerts or badge colors. */
+.strike-panel.strike-full-page{
+  background:#fff;
+  border:1px solid #dfe5ef;
+  border-radius:13px;
+  padding:14px;
+  box-sizing:border-box;
+  min-width:0;
+}
+.strike-panel.strike-full-page .strike-table-scroll,
+.strike-panel.strike-full-page .strike-table{background:#fff}
 /* Mobile: preserve full data without changing the financial data or the
    existing responsive horizontal-scroll behavior for very narrow screens. */
 
