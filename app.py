@@ -3466,7 +3466,7 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None, live_e
              if equity_rows else '')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
          '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): Bloomberg MID (BID + ASK) / 2; missing BID is zero when ASK exists. PUT = MID / Strike; CALL = MID / Bloomberg underlying price. Multiply by 364 / days to expiry × 100. On expiration day IRR uses DTE=1 until NY market close, then shows —.">ⓘ</abbr></th><th>Qty</th>'
-         '<th>Non-Live Exposure <abbr class="strike-exposure-info" title="Nirvana Exposure Summary PDF, as of prior report date; includes all six categories in fund total">ⓘ</abbr></th>'
+         f'<th>{"Non-Live Exposure" if full else "Exposure"} <abbr class="strike-exposure-info" title="Non-Live — Nirvana Exposure Summary PDF, prior report date; the fund total covers all six categories">ⓘ</abbr></th>'
          '<th>Live Exposure Est. <abbr class="strike-exposure-info" title="Estimated live notional exposure using Bloomberg Daily Return quantities, validated underlying prices and NAV">ⓘ</abbr></th>'
          '<th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
@@ -3543,6 +3543,32 @@ STRIKE_MONITOR_CSS="""
 .strike-equity-divider td{text-align:left!important;font-weight:750!important;color:#374765;background:#f6f9fd}
 .strike-equity-row td{background:#fafbfd}
 @media(max-width:760px){.strike-table{min-width:930px}.strike-panel .headgroup{gap:5px}.strike-total-box{flex:1 1 150px;min-width:0}}
+/* v6.15.7.19.2: Desktop OVERVIEW ONLY — all 10 columns fit each fund.
+   Do not shrink the other monitors and do not clip financial values.
+   The full-list retains its spacious existing layout and headings. */
+@media(min-width:761px){
+  .funds .strike-panel .strike-table-scroll{overflow-x:hidden!important;overflow-y:visible!important}
+  .funds .strike-panel .strike-table{width:100%;max-width:100%;min-width:0!important;table-layout:fixed}
+  .funds .strike-panel .strike-table th,
+  .funds .strike-panel .strike-table td{padding:6px 2px;font-size:clamp(9px,.70vw,11px);line-height:1.2;box-sizing:border-box;overflow:visible}
+  .funds .strike-panel .strike-table th{white-space:normal;overflow-wrap:normal;word-break:normal;vertical-align:middle;line-height:1.16}
+  .funds .strike-panel .strike-table td{white-space:nowrap}
+  .funds .strike-panel .strike-table th:nth-child(1){width:14%}
+  .funds .strike-panel .strike-table th:nth-child(2){width:10%}
+  .funds .strike-panel .strike-table th:nth-child(3){width:9%}
+  .funds .strike-panel .strike-table th:nth-child(4){width:11%}
+  .funds .strike-panel .strike-table th:nth-child(5){width:7%}
+  .funds .strike-panel .strike-table th:nth-child(6){width:6%}
+  .funds .strike-panel .strike-table th:nth-child(7){width:8%}
+  .funds .strike-panel .strike-table th:nth-child(8){width:13%}
+  .funds .strike-panel .strike-table th:nth-child(9){width:10%}
+  .funds .strike-panel .strike-table th:nth-child(10){width:12%}
+  .funds .strike-panel .strike-irr{min-width:0;max-width:100%;padding:5px 1px;font-size:inherit}
+  .funds .strike-panel .strike-distance{display:inline-block;box-sizing:border-box;min-width:0;width:100%;max-width:100%;padding:5px 1px;font-size:inherit;white-space:nowrap}
+  .funds .strike-panel .strike-exposure-info{font-size:10px}
+}
+/* Mobile: preserve full data without changing the financial data or the
+   existing responsive horizontal-scroll behavior for very narrow screens. */
 
 """
 
