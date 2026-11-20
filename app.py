@@ -2724,62 +2724,148 @@ def _strike_pdf_option_key(ticker, expiry, option_type, strike):
         return ""
 
 
-def _parse_nirvana_strike_pdf_exposure(data:bytes, expected_fund:str, filename:str):
+# v6.15.7.19: Financially complete Nirvana Exposure Summary parsing.
+# Six independent columns, not the old option-only LIM/LOM extraction.
+_STRIKE_PDF_CATEGORIES = ("Long", "LIM", "LOM", "Short", "SIM", "SOM")
+# Name-to-ticker mappings are strictly limited to verified identifiers on
+# supplied Nirvana reports. Unknown company names remain visible by name;
+# never silently guess a ticker or drop its exposure from the official total.
+_STRIKE_PDF_EQUITY_ALIASES = {
+    "ZOOMINFO TECHNOLOGIES INC": "GTM",
+    "ORACLE CORPORATION": "ORCL",
+    "POOL CORP": "POOL",
+}
+
+
+def _parse_nirvana_strike_pdf_exposure(data: bytes, expected_fund: str, filename: str):
     if not data.startswith(b"%PDF-"):
         raise ValueError("The uploaded file is not a valid PDF.")
     if not 0 < len(data) <= 12 * 1024 * 1024:
         raise ValueError("PDF exceeds the 12 MB upload limit.")
     try:
-        reader=PdfReader(BytesIO(data))
-        if not reader.pages or len(reader.pages)>20:
+        reader = PdfReader(BytesIO(data))
+        if not reader.pages or len(reader.pages) > 20:
             raise ValueError("Unexpected PDF page count.")
-        parts=[]
+        parts = []
         for pdf_page in reader.pages:
             try:
-                content=pdf_page.extract_text(extraction_mode="layout") or ""
+                content = pdf_page.extract_text(extraction_mode="layout") or ""
             except TypeError:
-                content=pdf_page.extract_text() or ""
+                content = pdf_page.extract_text() or ""
             if not content.strip():
-                content=pdf_page.extract_text() or ""
+                content = pdf_page.extract_text() or ""
             parts.append(content)
-        first=parts[0]
-        all_text="\n".join(parts)
+        first = parts[0]
     except Exception as exc:
         raise ValueError("Could not read text from Nirvana PDF.") from exc
     if "exposure summary" not in first.lower():
         raise ValueError("Expected a Nirvana Exposure Summary PDF.")
-    correct_name="Fortress Fund" if expected_fund=="fortress" else "Opportunity Fund"
+    correct_name = "Fortress Fund" if expected_fund == "fortress" else "Opportunity Fund"
     if not re.search(re.escape(correct_name), first, re.IGNORECASE):
         raise ValueError("PDF does not match the selected fund: " + correct_name)
-    date_match=re.search(r"Report\s+Date\s*:\s*(\d{1,2}/\d{1,2}/\d{4})",first,re.I)
-    if date_match is None:
+    match = re.search(r"Report\s+Date\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", first, re.I)
+    if match is None:
         raise ValueError("Report Date not found in the PDF.")
     try:
-        report_date=datetime.strptime(date_match.group(1),"%m/%d/%Y").date().isoformat()
+        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date().isoformat()
     except ValueError as exc:
         raise ValueError("Invalid Report Date in PDF.") from exc
-
-    found={}
-    for match in STRIKE_PDF_EXPOSURE_PATTERN.finditer(all_text):
-        g=match.groupdict()
-        yy=int(g["year"])
-        if yy<100: yy+=2000
-        try:
-            expiration=date(yy,int(g["month"]),int(g["day"])).isoformat()
-            value=float(g["exposure"])
-            if not math.isfinite(value):raise ValueError()
-        except (ValueError,OverflowError) as exc:
-            raise ValueError("Invalid option contract/Exposure percentage in PDF.") from exc
-        key=_strike_pdf_option_key(g["ticker"],expiration,g["option_type"],g["strike"])
-        if key in found:
-            raise ValueError("Duplicate option exposure in PDF: " + key)
-        found[key]=round(value,6)
-    if not found:
-        raise ValueError("No per-option exposure values found in the PDF. Nothing was saved.")
-    return {"report_date":report_date,"filename":str(filename or "Exposure.pdf"),
+    lines = first.splitlines()
+    footer_index = next((i for i, line in enumerate(lines) if re.search(r"Grand\s+Total\s*:", line, re.I)), None)
+    header_index = next((i for i, line in enumerate(lines) if all(re.search(r"\b" + c + r"\b", line) for c in _STRIKE_PDF_CATEGORIES)), None)
+    if header_index is None or footer_index is None or header_index >= footer_index:
+        raise ValueError("Six exposure categories and their Grand Total row are required on page 1.")
+    # Use the six percentage positions in Nirvana's first-page Grand Total row
+    # as the columns' physical anchors; no fixed-width guesses or page-2
+    # summary double-counting.
+    percent_rx = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
+    total_matches = list(percent_rx.finditer(lines[footer_index]))
+    if len(total_matches) != 6:
+        raise ValueError("Cannot reliably identify all six category totals in PDF.")
+    anchors = [m.start() for m in total_matches]
+    if any(b <= a for a, b in zip(anchors, anchors[1:])):
+        raise ValueError("Malformed category column positions in PDF.")
+    boundaries = [0] + [a + (b-a)//5 for a,b in zip(anchors, anchors[1:])] + [10**6]
+    category_totals = {name: round(float(m.group(1)), 6)
+                       for name,m in zip(_STRIKE_PDF_CATEGORIES, total_matches)}
+    positions, equities, category_rows = {}, {}, {name: [] for name in _STRIKE_PDF_CATEGORIES}
+    option_rx = re.compile(
+        r"([A-Z][A-Z0-9.\-]*)\s+(\d{1,2})/(\d{1,2})/(\d{2,4})\s+"
+        r"(\d+(?:\.\d+)?)\s+(PUT|CALL)", re.I)
+    for line in lines[header_index+1:footer_index]:
+        if "%" not in line:
+            continue
+        for idx, name in enumerate(_STRIKE_PDF_CATEGORIES):
+            segment = line[boundaries[idx]:boundaries[idx+1]].strip()
+            if not segment:
+                continue
+            row_match = re.fullmatch(r"(.+?)\s+([+-]?\d+(?:\.\d+)?)\s*%", segment)
+            if row_match is None:
+                raise ValueError("Unrecognized " + name + " exposure row: " + segment[:100])
+            descriptor = row_match.group(1).strip()
+            pct = float(row_match.group(2))
+            if not math.isfinite(pct):
+                raise ValueError("Non-finite exposure percentage in PDF.")
+            option_match = option_rx.fullmatch(descriptor)
+            if option_match:
+                ticker, month, day, yy, strike, opt = option_match.groups()
+                year = int(yy)
+                if year < 100:
+                    year += 2000
+                try:
+                    expiry = date(year, int(month), int(day)).isoformat()
+                except ValueError as exc:
+                    raise ValueError("Invalid option expiration in Nirvana PDF.") from exc
+                key = _strike_pdf_option_key(ticker, expiry, opt, strike)
+                if not key or key in positions:
+                    raise ValueError("Missing/duplicate option identity in Nirvana PDF: " + descriptor)
+                positions[key] = pct
+                category_rows[name].append({"type":"OPTION", "key":key, "exposure_pct":pct})
+            else:
+                if name not in ("Long", "Short"):
+                    # Don't mistake any other instruments for equity or make up a ticker.
+                    raise ValueError("Unrecognized instrument in " + name + " column: " + descriptor)
+                source_name = " ".join(descriptor.upper().split())
+                ticker = _STRIKE_PDF_EQUITY_ALIASES.get(source_name)
+                if not ticker and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", source_name):
+                    ticker = source_name
+                key = ("EQUITY|" + ticker) if ticker else ("EQUITY_NAME|" + source_name)
+                if key in equities:
+                    raise ValueError("Duplicate equity exposure in Nirvana PDF: " + source_name)
+                equities[key] = {"ticker":ticker, "name":source_name, "category":name,
+                                 "exposure_pct":pct}
+                category_rows[name].append({"type":"EQUITY", "key":key, "exposure_pct":pct})
+    if not positions and not equities:
+        raise ValueError("No exposure positions could be extracted from the PDF.")
+    # Check that the individual parsed rows reconcile to the six category
+    # totals within the precision expected from two-decimal rounding. This
+    # catches dropped rows and column-shift parsing without rejecting normal
+    # 0.01%-0.02% Nirvana rounding differences.
+    for category in _STRIKE_PDF_CATEGORIES:
+        entries = category_rows[category]
+        subtotal = sum(float(item["exposure_pct"]) for item in entries)
+        tolerance = max(0.04, len(entries)*0.005 + 0.015)
+        if abs(subtotal - category_totals[category]) > tolerance:
+            raise ValueError("Unreconciled " + category + " PDF exposure rows: "
+                             f"{subtotal:.2f}% versus {category_totals[category]:.2f}%")
+    # The authoritative fund total is on the PDF's second-page summary, NOT
+    # the sum of rounded option rows (nor only the strike-risk subset).
+    reported_total = None
+    if len(parts) > 1:
+        totals = re.findall(r"Grand\s+Total\s*:\s*([+-]?\d+(?:\.\d+)?)\s*%", parts[1], flags=re.I)
+        if totals:
+            reported_total = float(totals[-1])
+    if reported_total is None:
+        raise ValueError("Official fund Grand Total not found on page 2; upload rejected without overwriting the prior report.")
+    six_sum = sum(category_totals.values())
+    if not math.isfinite(reported_total) or abs(six_sum-reported_total) > 0.10:
+        raise ValueError("Category totals disagree with the official Grand Total: "
+                         f"{six_sum:.2f}% versus {reported_total:.2f}%")
+    return {"report_date":report_date, "filename":str(filename or "Exposure.pdf"),
             "uploaded_at":datetime.now(timezone.utc).isoformat(),
-            "positions":found,"count":len(found)}
-
+            "positions":positions, "count":len(positions), "equities":equities,
+            "category_totals":category_totals, "category_rows":category_rows,
+            "total_pct":reported_total, "source":"Nirvana Exposure Summary", "schema_version":2}
 
 def _get_strike_pdf_exposure(db, fund):
     val=_json_setting(db,STRIKE_PDF_EXPOSURE_PREFIX + fund,{})
@@ -3244,7 +3330,50 @@ def _strike_proximity_data(snapshot, expected_version, *, include_all=False, as_
     return result
 
 
-def _strike_row_html(row, exposure_report=None):
+# v6.15.7.19: Strike view adds only two read-only exposure comparisons.
+# One existing calculated estimate (Daily Return) serves both the overview
+# and the full list; no collector, position, NAV, P&L or risk-color changes.
+def _strike_live_exposure_pct(row, estimate):
+    try:
+        key = _dr_position_key({"instrument_type":"OPTION", "ticker":row["ticker"],
+                                "expiry":row["expiry"], "option_type":row["type"],
+                                "strike":row["strike"]})
+    except (ValueError, TypeError, OverflowError):
+        return None
+    values = (estimate or {}).get("by_key", {})
+    if key in values:
+        return values[key]
+    # Older Nirvana imports may retain "PUT"/"CALL" instead of P/C.
+    # Match only the same ticker + expiry + strike + side, never ticker alone.
+    expanded = "PUT" if str(row.get("type") or "").upper().startswith("P") else "CALL"
+    return values.get((key[0], key[1], key[2], expanded, key[4]))
+
+
+def _strike_equity_exposure_rows(pdf_report, calc, estimate):
+    pdf_equities = (pdf_report or {}).get("equities") or {}
+    found = {}
+    if isinstance(pdf_equities, dict):
+        for key, info in pdf_equities.items():
+            if isinstance(info, dict):
+                found[key] = dict(info, quantity=None, market_mark=None, live_pct=None)
+    for r in (calc or {}).get("rows") or []:
+        if str(r.get("instrument_type") or "").upper() != "EQUITY":
+            continue
+        ticker = str(r.get("ticker") or "").upper().strip()
+        if not ticker:
+            continue
+        key = "EQUITY|"+ticker
+        if key not in found:
+            found[key] = {"ticker":ticker, "name":ticker,
+                          "exposure_pct":None, "category":None}
+        info = found[key]
+        info["quantity"] = r.get("quantity")
+        info["market_mark"] = r.get("market_mark")
+        info["live_pct"] = (estimate or {}).get("by_key", {}).get(_dr_position_key(r))
+    return sorted(found.values(),key=lambda r:(str(r.get("ticker") or r.get("name") or "")))
+
+
+def _strike_row_html(row, exposure_report=None, live_est=None):
     distance=row.get("distance")
     if distance is None:
         dist_html='<span class="strike-distance strike-missing">—</span>'
@@ -3256,16 +3385,57 @@ def _strike_row_html(row, exposure_report=None):
     exposure=_strike_pdf_exposure_info(exposure_report,row)
     pdf_date=html.escape(str((exposure_report or {}).get("report_date") or "No Nirvana PDF uploaded"),quote=True)
     exposure_label=("—" if exposure is None else f"{exposure:.2f}%")
+    live_pct=_strike_live_exposure_pct(row,live_est)
+    live_label=("—" if live_pct is None else f"{live_pct:,.2f}%")
     irr=row.get("irr")
     irr_label="—" if irr is None else f"{irr:,.2f}%"
     irr_title="Annualized Premium Return (not true IRR): Bloomberg MID = (BID + ASK) / 2 (missing BID = 0 when ASK exists); PUT = MID / Strike, CALL = MID / Bloomberg underlying price; multiply by 364 / calendar days to expiry × 100. On expiration day IRR uses DTE=1 until NY market close, then shows —."
     irr_html=(f'<span class="strike-irr strike-irr-green">{irr_label}</span>' if irr is not None and irr<=10.0 else f'<span class="strike-irr">{irr_label}</span>')
-    return (f'<tr><td title="{irr_title}">{irr_html}</td><td>{row["qty"]:,.0f}</td><td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td><td>{html.escape(row["ticker"])}</td>'
+    return (f'<tr><td title="{irr_title}">{irr_html}</td><td>{row["qty"]:,.0f}</td>'
+            f'<td title="Non-Live · Nirvana PDF report {pdf_date}">{exposure_label}</td>'
+            f'<td title="{html.escape(_LIVE_EXPOSURE_TOOLTIP,quote=True)}">{live_label}</td>'
+            f'<td>{html.escape(row["ticker"])}</td>'
             f'<td>{"Put" if row["type"]=="P" else "Call"}</td><td>${row["strike"]:,.2f}</td>'
             f'<td>{html.escape(row["expiry"])}</td><td title="{tooltip}">{stock}</td><td>{dist_html}</td></tr>')
 
 
-def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
+def _strike_equity_row_html(r, pdf_report=None):
+    nonlive=r.get("exposure_pct")
+    live=r.get("live_pct")
+    q=r.get("quantity")
+    price=r.get("market_mark")
+    label=html.escape(str(r.get("ticker") or r.get("name") or "Unknown equity"))
+    name=html.escape(str(r.get("name") or label),quote=True)
+    non_label='—' if nonlive is None else f'{float(nonlive):,.2f}%'
+    live_label='—' if live is None else f'{float(live):,.2f}%'
+    qty='—' if q is None else f'{float(q):,.0f}'
+    price_label='—' if price is None else f'${float(price):,.2f}'
+    return (f'<tr class="strike-equity-row"><td>—</td><td>{qty}</td>'
+            f'<td title="Nirvana Equity: {name}">{non_label}</td>'
+            f'<td title="{html.escape(_LIVE_EXPOSURE_TOOLTIP,quote=True)}">{live_label}</td>'
+            f'<td title="{name}">{label}</td><td>Equity</td><td>—</td><td>—</td>'
+            f'<td>{price_label}</td><td>—</td></tr>')
+
+
+def _strike_exposure_total_cards(pdf_report, live_est):
+    nonlive=(pdf_report or {}).get("total_pct")
+    live=(live_est or {}).get("total_pct")
+    partial=bool((live_est or {}).get("partial"))
+    non_text='—' if nonlive is None else f'{float(nonlive):,.2f}%'
+    live_text='—' if live is None else f'{float(live):,.2f}%'
+    pdf_date=html.escape(str((pdf_report or {}).get("report_date") or "PDF not uploaded"))
+    if nonlive is None:
+        non_note='Re-upload the Nirvana Exposure Summary PDF to read the official fund total.'
+    else:
+        non_note='Official Nirvana Grand Total from all six categories (Long, LIM, LOM, Short, SIM, SOM).'
+    live_note = ('PARTIAL · ' + str((live_est or {}).get('reason') or 'unavailable position data')) if partial else 'Bloomberg-estimated NAV'
+    return ('<div class="strike-exposure-totals">'
+            f'<div class="strike-total-box" title="{html.escape(non_note,quote=True)}"><span>Non-Live Exposure Total</span><strong>{non_text}</strong><small>Report {pdf_date}</small></div>'
+            f'<div class="strike-total-box" title="{html.escape(_LIVE_EXPOSURE_TOOLTIP,quote=True)}"><span>Live Exposure Est. Total</span><strong>{live_text}</strong><small>{html.escape(live_note)}</small></div>'
+            '</div>')
+
+
+def _strike_monitor_html(data, fund, *, full=False, exposure_report=None, live_est=None, equity_rows=None):
     url=f'/strike-proximity/{fund}'
     rows=data["all_rows"] if full else data["rows"]
     warning=''
@@ -3283,17 +3453,27 @@ def _strike_monitor_html(data, fund, *, full=False, exposure_report=None):
             +('' if full else f'<a href="{url}">Open full list →</a>')+'</div>')
     meta=(f'<div class="strike-meta">Bloomberg only · {html.escape(data["state"])}'
           +(f' · {html.escape(data["source_date"])}' if data["source_date"] else '')+'</div>')
-    message=('<tr><td colspan="9" class="strike-empty">'
-             +('Waiting for current Bloomberg data.' if data["message"] else
+    empty='<tr><td colspan="10" class="strike-empty">'+(
+               'Waiting for current Bloomberg data.' if data["message"] else
                'No active options available.' if data["total"]==0 else
                'No positions within 10% of strike or ITM.' if not full else
-               'No positions with a valid Bloomberg price.')+'</td></tr>')
+               'No positions with a valid Bloomberg price.')+'</td></tr>'
+    equity_rows = equity_rows or []
+    # Equity is explicitly separate from options; no strike/expiry/IRR/OOM and
+    # never increases the "within 10%" options count.
+    equiv = (('<tr class="strike-equity-divider"><td colspan="10">Equity Exposure</td></tr>' +
+              ''.join(_strike_equity_row_html(r,exposure_report) for r in equity_rows))
+             if equity_rows else '')
     tab=('<div class="strike-table-scroll"><table class="strike-table"><thead><tr>'
-         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): Bloomberg MID (BID + ASK) / 2; missing BID is zero when ASK exists. PUT = MID / Strike; CALL = MID / Bloomberg underlying price. Multiply by 364 / days to expiry × 100. On expiration day IRR uses DTE=1 until NY market close, then shows —.">ⓘ</abbr></th><th>Qty</th><th>Exposure <abbr class="strike-exposure-info" title="Non-Live — previous day&#39;s Nirvana Exposure PDF">ⓘ</abbr></th><th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
+         '<th>IRR <abbr class="strike-exposure-info" title="Annualized Premium Return (not true IRR): Bloomberg MID (BID + ASK) / 2; missing BID is zero when ASK exists. PUT = MID / Strike; CALL = MID / Bloomberg underlying price. Multiply by 364 / days to expiry × 100. On expiration day IRR uses DTE=1 until NY market close, then shows —.">ⓘ</abbr></th><th>Qty</th>'
+         '<th>Non-Live Exposure <abbr class="strike-exposure-info" title="Nirvana Exposure Summary PDF, as of prior report date; includes all six categories in fund total">ⓘ</abbr></th>'
+         '<th>Live Exposure Est. <abbr class="strike-exposure-info" title="Estimated live notional exposure using Bloomberg Daily Return quantities, validated underlying prices and NAV">ⓘ</abbr></th>'
+         '<th>Ticker</th><th>Type</th><th>Strike</th><th>Expiration</th>'
          '<th>Last Price</th><th>Out of Money</th></tr></thead><tbody>'
-         +(''.join(_strike_row_html(r,exposure_report) for r in rows) if rows else message)
-         +'</tbody></table></div>')
-    return f'<div class="summarypanel strike-panel">{header}{meta}{warning}{tab}</div>'
+         +(''.join(_strike_row_html(r,exposure_report,live_est) for r in rows) if rows else empty)
+         +equiv+'</tbody></table></div>')
+    totals=_strike_exposure_total_cards(exposure_report,live_est) if full else ''
+    return f'<div class="summarypanel strike-panel">{header}{meta}{totals}{warning}{tab}</div>'
 
 
 STRIKE_MONITOR_CSS="""
@@ -3301,11 +3481,11 @@ STRIKE_MONITOR_CSS="""
 .strike-panel .panelhead{margin-bottom:4px}
 .strike-meta{font-size:10.5px;color:#64748b;margin-bottom:6px}
 .strike-table-scroll{max-width:100%;overflow-x:auto}
-.strike-table{width:100%;min-width:785px;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.strike-table{width:100%;min-width:930px;border-collapse:collapse;font-variant-numeric:tabular-nums}
 .strike-table th,.strike-table td{padding:6px 8px;font-size:11.5px;white-space:nowrap;border-bottom:1px solid #e8edf4}
 .strike-table th{background:#f6f9fd;color:#182642;text-align:center;font-weight:700}
 .strike-table td{text-align:center}
-.strike-table th:nth-child(4),.strike-table td:nth-child(4){text-align:left;font-weight:650}
+.strike-table th:nth-child(5),.strike-table td:nth-child(5){text-align:left;font-weight:650}
 .strike-exposure-info{cursor:help;text-decoration:none;border:0;font-size:11px;color:#4c648b;font-weight:600}
 .strike-irr{display:inline-block;min-width:68px;padding:5px 7px;border-radius:7px;font-weight:700;font-variant-numeric:tabular-nums;color:#182642}
 .strike-irr-green{background:#dcfce7;color:#166534}
@@ -3319,7 +3499,17 @@ STRIKE_MONITOR_CSS="""
 .strike-note{font-size:11px;color:#6b7280;margin:5px 0 7px}
 .strike-note.strike-alert{color:#9a3412}
 .strike-empty{text-align:center!important;color:#6b7280;font-weight:400!important;padding:13px!important}
-@media(max-width:760px){.strike-table{min-width:785px}.strike-panel .headgroup{gap:5px}}
+/* New exposure UI only; rest of the original styling is untouched. */
+.strike-exposure-totals{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin:5px 0 10px}
+.strike-total-box{border:1px solid #dde6f3;border-radius:10px;background:#f7faff;padding:9px 15px;display:flex;flex-direction:column;gap:3px;min-width:190px;font-variant-numeric:tabular-nums}
+.strike-total-box span{font-size:11.5px;color:#64748b;font-weight:650}
+.strike-total-box strong{font-size:22px;color:#17233a}
+.strike-total-box small{font-size:10.5px;color:#64748b}
+.strike-total-box:nth-child(2){background:#f7fcfa;border-color:#d9ede2}
+.strike-equity-divider td{text-align:left!important;font-weight:750!important;color:#374765;background:#f6f9fd}
+.strike-equity-row td{background:#fafbfd}
+@media(max-width:760px){.strike-table{min-width:930px}.strike-panel .headgroup{gap:5px}.strike-total-box{flex:1 1 150px;min-width:0}}
+
 """
 
 # -----------------------------------------------------------------------------
@@ -3609,6 +3799,37 @@ FORTRESS_TR_OVERVIEW_BADGE=(
     '</div>'
 )
 
+def _strike_live_context(db, fund, snapshot, exposure_report):
+    """Read-only calculation identical to Bloomberg Daily Return Open details.
+
+    Works from the current P&L baseline plus intraday trade ledger (no
+    double count); never inserts into collector/positions or alters P&L.
+    """
+    if fund=="fortress":
+        baseline, positions = _fortress_daily_positions(db)
+        if not baseline:
+            calc = None
+            live = {"by_key":{}, "total_pct":None, "partial":True,
+                    "reason":"Fortress P&L baseline unavailable"}
+        else:
+            nav=float(baseline.nav_usd or 0)
+            calc=_daily_with_ledger(db,"fortress","bloomberg",positions,nav,snapshot,baseline.report_date)
+            live=_live_exposure_estimate(calc,nav,snapshot)
+    else:
+        baseline=_opportunity_baseline(db)
+        if not baseline:
+            calc = None
+            live={"by_key":{}, "total_pct":None, "partial":True,
+                  "reason":"Opportunity P&L baseline unavailable"}
+        else:
+            nav=float(baseline.get("nav_usd") or 0)
+            positions=_opp_baseline_positions_for_calc(baseline)
+            calc=_daily_with_ledger(db,"opportunity","bloomberg",positions,nav,snapshot,baseline.get("report_date"))
+            live=_live_exposure_estimate(calc,nav,snapshot)
+    equities=_strike_equity_exposure_rows(exposure_report,calc,live)
+    return live,equities
+
+
 @app.get("/overview")
 def overview(request:Request):
     u=require_user(request)
@@ -3658,6 +3879,8 @@ def overview(request:Request):
         ostrike=_strike_proximity_data(op,ocfg,age_seconds=oage)
         f_pdf_exposure=_get_strike_pdf_exposure(db,"fortress")
         o_pdf_exposure=_get_strike_pdf_exposure(db,"opportunity")
+        f_live_exposure, f_strike_equities=_strike_live_context(db,"fortress",fp,f_pdf_exposure)
+        o_live_exposure, o_strike_equities=_strike_live_context(db,"opportunity",op,o_pdf_exposure)
 
     def cls(v): return "ok" if v>=0 else "bad"
     def limit_txt(x): return "—" if x is None else f"{x:.3f}%"
@@ -3669,7 +3892,7 @@ def overview(request:Request):
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Bloomberg Daily Return</h3><span class="delay-badge bloomberg">◷&nbsp; 2-min delayed</span></div><a href="{bd_link}">Open details →</a></div><div class="mini-grid">
         <div class="mini"><span>Status</span><b class="ok">{bd_status}</b><small>Bloomberg marks</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(bd_ret)}">{bd_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(bd_pnl)}">${bd_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{bd_cov}</b><small>Bloomberg marks</small></div></div></div>
         <div class="summarypanel"><div class="panelhead"><div class="headgroup"><h3>Yahoo Daily Return</h3><span class="delay-badge yahoo">◷&nbsp; 15-min delayed</span></div><a href="{y_link}">Open details →</a></div><div class="mini-grid">
-        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data, fund_key,exposure_report=pdf_exposure)}</section>'''
+        <div class="mini"><span>Status</span><b class="ok">{y_status}</b><small>Mark-to-market estimate</small></div><div class="mini"><span>Estimated Daily Return</span><b class="{cls(y_ret)}">{y_ret:+.4f}%</b></div><div class="mini"><span>Estimated P&amp;L</span><b class="{cls(y_pnl)}">${y_pnl:+,.2f}</b></div><div class="mini"><span>Baseline NAV</span><b>${nav:,.2f}</b><small>Report {html.escape(report)}</small></div><div class="mini"><span>Coverage</span><b>{y_cov}</b><small>Yahoo local collector marks</small></div></div></div>{_strike_monitor_html(strike_data,fund_key,exposure_report=pdf_exposure,live_est=(o_live_exposure if fund_key=="opportunity" else f_live_exposure),equity_rows=(o_strike_equities if fund_key=="opportunity" else f_strike_equities))}</section>'''
 
     body=f'''<style>.funds{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:auto repeat(3,auto) auto;column-gap:18px;row-gap:14px;align-items:start}}.fundcol{{min-width:0;display:grid;grid-column:auto;grid-row:span 5;grid-template-rows:subgrid;row-gap:14px;align-self:stretch}}.fundcol>.strike-panel{{height:auto;align-self:start}}.fundtitle{{padding:12px 18px;border-radius:12px 12px 0 0;margin-bottom:0}}.fundtitle h2{{margin:0;font-size:24px}}.fundtitle.fortress{{background:#eef6ff;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}}.rpd-tr-group{{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:nowrap;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:0;max-width:100%}}.rpd-tr-item{{display:inline-flex;align-items:center;gap:4px;min-width:0}}.rpd-tr-group .rpd-vix-label{{font-size:11px;letter-spacing:0}}.rpd-tr-group .rpd-vix-price{{font-size:14px}}.rpd-tr-group .rpd-vix-change{{font-size:11px}}.rpd-tr-refresh{{flex:0 0 auto;font-size:9px;padding:2px 5px;white-space:nowrap}}@media(max-width:1510px){{.fundtitle.fortress h2{{font-size:20px}}.rpd-tr-group{{gap:5px;flex-wrap:wrap}}.rpd-tr-group .rpd-vix-label{{font-size:10px}}.rpd-tr-group .rpd-vix-price{{font-size:12.5px}}.rpd-tr-group .rpd-vix-change{{font-size:10px}}}}@media(max-width:1330px){{.fundtitle.fortress{{flex-wrap:wrap}}.rpd-tr-group{{flex-wrap:wrap}}}}.fundtitle.opportunity{{background:#f5efff;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}}.rpd-vix{{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums;white-space:nowrap}}.rpd-vix-label{{font-size:12.5px;font-weight:700;letter-spacing:.2px;color:#475569}}.rpd-vix-price{{font-size:19px;font-weight:800;color:#17233a}}.rpd-vix-change{{font-size:12px;font-weight:750;color:#63728b}}.rpd-vix-change.is-up{{color:#087a4b}}.rpd-vix-change.is-down{{color:#c22a20}}.rpd-vix-delay{{background:#eef3fb;border:1px solid #dde7f5;color:#2d4771;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:650}}@media(max-width:800px){{.rpd-vix{{gap:5px}}.rpd-vix-delay{{font-size:9px}}.rpd-vix-price{{font-size:17px}}}}.summarypanel{{background:#fff;border:1px solid #dfe5ef;border-radius:13px;padding:14px;margin-bottom:0;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.panelhead{{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}}.headgroup{{display:flex;align-items:center;gap:9px;min-width:0;flex-wrap:wrap}}.panelhead h3{{margin:0;font-size:19px}}.panelhead a{{font-size:13px;white-space:nowrap}}.delay-badge{{display:inline-flex;align-items:center;white-space:nowrap;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1;border:1px solid transparent}}.delay-badge.bloomberg{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.delay-badge.yahoo{{background:#eef3fb;color:#2d4771;border-color:#dde7f5}}.mini-grid{{display:grid;grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr;gap:9px;flex:1;align-items:stretch}}.mini{{border:1px solid #e4e9f1;border-radius:10px;padding:10px;min-height:98px;min-width:0;overflow:hidden;display:flex;flex-direction:column;height:100%;box-sizing:border-box}}.mini span{{display:block;color:#73819a;font-size:12px;line-height:1.25;min-height:30px}}.mini small{{display:block;color:#73819a;font-size:12px;line-height:1.25}}.mini b{{display:block;font-size:14.5px;line-height:1.15;margin:6px 0 4px;white-space:nowrap;letter-spacing:-.35px;font-variant-numeric:tabular-nums}}.mini:first-child b{{white-space:normal;font-size:14px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:14px}}@media(min-width:1700px){{.mini b{{font-size:15.5px}}.mini:first-child b{{font-size:15px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:15px}}}}@media(max-width:1250px){{.funds{{grid-template-columns:1fr;grid-template-rows:none}}.fundcol{{grid-row:auto;grid-template-rows:auto repeat(3,auto) auto}}.fundcol>.strike-panel{{height:auto}}.mini-grid{{grid-template-columns:.95fr 1fr 1.18fr 1.25fr .95fr}}.mini b{{font-size:18px}}.mini:first-child b{{font-size:17px}}.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}}}@media(max-width:800px){{.mini-grid{{grid-template-columns:1fr 1fr}}.mini b,.mini:first-child b,.mini:nth-child(3) b,.mini:nth-child(4) b{{font-size:17px}}.delay-badge{{font-size:11px;padding:4px 8px}}}}{STRIKE_MONITOR_CSS}
 @media(max-width:760px){{
@@ -3758,13 +3981,14 @@ def strike_proximity_full(request:Request,fund:str):
             cfg=int(get_setting(db,"opportunity_config_version","1") or 1)
         data=_strike_proximity_data(snapshot,cfg,age_seconds=age)
         pdf_exposure=_get_strike_pdf_exposure(db,fund)
+        live_exposure, strike_equities=_strike_live_context(db,fund,snapshot,pdf_exposure)
     title="RPD Fortress Fund" if fund=="fortress" else "RPD Opportunity Fund"
     body=('<div style="margin-bottom:12px"><a href="/overview">← Back to Overview</a></div>'
           f'<h1>{title} — Strike Proximity Monitor</h1>'
           '<p class="muted">Bloomberg underlying prices only. Negative Out of Money means ITM; '
           'these are monitoring estimates, not trade or assignment instructions.</p>'
           f'<style>{STRIKE_MONITOR_CSS}.strike-table th,.strike-table td{{font-size:13px;padding:9px}}</style>'
-          +_strike_monitor_html(data,fund,full=True,exposure_report=pdf_exposure))
+          +_strike_monitor_html(data,fund,full=True,exposure_report=pdf_exposure,live_est=live_exposure,equity_rows=strike_equities))
     return page("Strike Proximity Monitor",body,user,60)
 
 
@@ -3973,17 +4197,17 @@ def admin_strike_pdf_upload_page(request:Request,fund:str):
     with SessionLocal() as db:
         info=_get_strike_pdf_exposure(db,fund)
     if info:
-        history=f'<div class="notice"><strong>Current Non-Live Exposure:</strong> {html.escape(str(info.get("filename") or ""))} · Report {html.escape(str(info.get("report_date") or ""))} · {len(info.get("positions") or {})} option(s) matched by full contract identity</div>'
+        history=f'<div class="notice"><strong>Current Non-Live Exposure:</strong> {html.escape(str(info.get("filename") or ""))} · Report {html.escape(str(info.get("report_date") or ""))} · {len(info.get("positions") or {})} option(s) · {len(info.get("equities") or {})} equity(s) · Official Grand Total: {(f"{float(info.get('total_pct')):,.2f}%" if info.get('total_pct') is not None else "re-upload PDF to update total")}</div>'
     else:
         history='<p class="muted">No Exposure Summary PDF uploaded yet; Strike Proximity will show — until a matching PDF is provided.</p>'
     body=admin_tabs()+f'''<h1>{label} — Exposure Upload</h1>
 <div class="card"><h3>Exposure Upload (PDF)</h3>
 <p>Upload the previous close Nirvana <strong>Exposure Summary</strong> PDF for {label} Fund.
-This adds <strong>non-live Exposure %</strong> values only to the Strike Proximity Monitor; it does not update the existing Exposure XLSX, NAV, positions, Delta or Daily Return.</p>
+This reads all six Nirvana exposure categories, official Grand Total, and each instrument's <strong>non-live Exposure %</strong> for Strike Proximity; it does not update the existing Exposure XLSX, NAV, positions, Delta or Daily Return.</p>
 <form method="post" action="/admin/{fund}/exposure-pdf" enctype="multipart/form-data">
 <input type="file" name="file" accept=".pdf,application/pdf" required>
 <button type="submit">Upload {label} Exposure PDF</button></form><br>
-{history}<p class="muted">Matching uses ticker, expiration, Put/Call and strike. If no matching contract exists in the PDF, the Exposure column displays —. The newest uploaded report replaces the earlier Non-Live Exposure snapshot for this fund only.</p></div>'''
+{history}<p class="muted">Option matching uses ticker, expiration, Put/Call and strike; recognized Equity names are also linked to the ticker, while unknown names remain visible without guessing. If no matching position exists in the PDF, Non-Live Exposure displays —. The newest uploaded report replaces the earlier Non-Live Exposure snapshot for this fund only.</p></div>'''
     return page("Exposure PDF Upload",body,user,admin_pdf_fund=fund)
 
 
@@ -4007,7 +4231,7 @@ async def admin_strike_pdf_upload_save(request:Request,fund:str,file:UploadFile=
             raise HTTPException(400,"Older Exposure PDF not applied. Current report date is " + old_date)
         _set_json_setting(db,STRIKE_PDF_EXPOSURE_PREFIX+fund,report)
         audit(db,user["username"],"STRIKE_PDF_EXPOSURE_UPLOAD",
-              f'fund={fund};report={report["report_date"]};options={report["count"]}')
+              f'fund={fund};report={report["report_date"]};options={report["count"]};equities={len(report["equities"])};total_pct={report["total_pct"]}')
         db.commit()
     return RedirectResponse(f"/admin/{fund}/exposure-pdf",303)
 
