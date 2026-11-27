@@ -324,12 +324,12 @@ def page(title,body,user=None,refresh=None,admin_pdf_fund=None):
         elif key=="opp_bloomberg": active=(t=="opportunity bloomberg delta monitor")
         elif key=="opp_daily": active=(t=="opportunity bloomberg daily return")
         elif key=="opp_yahoo": active=(t=="opportunity yahoo daily return")
-        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload","exposure pdf upload"}
+        elif key=="admin": active=t in {"admin","fortress setup","opportunity setup","opportunity bloomberg visibility","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload","exposure pdf upload"}
         return "active" if active else ""
 
     if user:
         _record_user_seen(user.get("username"))
-    admin_titles={"admin","fortress setup","opportunity setup","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload","exposure pdf upload"}
+    admin_titles={"admin","fortress setup","opportunity setup","opportunity bloomberg visibility","users","online users","audit","nirvana import","nirvana import preview","map import","import preview","daily return upload","exposure pdf upload"}
     is_admin_page=bool(user and user.get("username")==ADMIN_USER and str(title or "").lower() in admin_titles)
 
     if user:
@@ -381,6 +381,7 @@ def page(title,body,user=None,refresh=None,admin_pdf_fund=None):
           '<div class="side-group"><div class="side-group-title">Opportunity Fund</div>'
           f'<a href="/admin/opportunity" class="{sactive("opportunity setup")}">PNL / Exposure Upload</a>'
           f'<a href="/admin/opportunity/exposure-pdf" class="{sactive("exposure pdf upload") if admin_pdf_fund=="opportunity" else ""}">Exposure Upload (PDF)</a>'
+          f'<a href="/admin/opportunity/bloomberg-visibility" class="{sactive("opportunity bloomberg visibility")}">Bloomberg Row Visibility</a>'
           '<a href="/opportunity">Delta Positions</a><a href="/opportunity/bloomberg-daily-return">Bloomberg Daily Return</a><a href="/opportunity/yahoo-daily-return">Yahoo Daily Return</a></div>'
           '<div class="side-group side-tools">'
           f'<a href="/admin/users" class="{sactive("users")}">User Management</a>'
@@ -762,6 +763,59 @@ def _opp_position_label(p):
         except Exception: strike=str(p.get("strike") or "")
         return f"{ticker} {p.get('expiry') or ''} {str(p.get('option_type') or '').upper()[:1]}{strike}".strip()
     return ticker
+
+
+# Opportunity Bloomberg Daily Return: per-viewer ROW VISIBILITY only.
+# The Setting is persistent in the existing database. Never use it to mutate
+# baseline positions, Bloomberg snapshots, NAV, calculations, or exports.
+_OPP_BLOOMBERG_ROW_VISIBILITY_KEY = "opportunity_bloomberg_hidden_rows_by_user_v1"
+
+
+def _opp_bloomberg_hidden_by_user(db):
+    stored = _json_setting(db, _OPP_BLOOMBERG_ROW_VISIBILITY_KEY, {})
+    if not isinstance(stored, dict):
+        return {}
+    out = {}
+    for username, keys in stored.items():
+        if not isinstance(username, str) or not isinstance(keys, list):
+            continue
+        out[username.strip().lower()] = sorted({
+            key for key in keys if isinstance(key, str) and
+            (key.startswith("OPTION|") or key.startswith("EQUITY|"))
+        })
+    return out
+
+
+def _opp_bloomberg_rows_for_viewer(rows, username, hidden_by_user):
+    """Presentation-only filter. Always call AFTER the complete P&L calculation.
+
+    The filtering is performed on the server: hidden rows are absent from the
+    response HTML, rather than only being hidden with CSS or JavaScript.
+    Admin and all unconfigured viewers see every position.
+    """
+    name = str(username or "").strip().lower()
+    if name == ADMIN_USER:
+        return list(rows)
+    hidden = set(hidden_by_user.get(name, ()))
+    if not hidden:
+        return list(rows)
+    return [row for row in rows if _opp_position_identity(row) not in hidden]
+
+
+def _opp_bloomberg_visibility_positions(db):
+    """Use the exact Opportunity Bloomberg table inventory (including intraday)."""
+    baseline = _opportunity_baseline(db)
+    if not baseline:
+        return [], ""
+    snapshot, _age = _latest_opportunity_snapshot(db)
+    positions = _opp_baseline_positions_for_calc(baseline)
+    calc = _daily_with_ledger(db, "opportunity", "bloomberg", positions,
+                              float(baseline.get("nav_usd") or 0), snapshot,
+                              baseline.get("report_date"))
+    unique = {}
+    for row in calc.get("rows", []):
+        unique.setdefault(_opp_position_identity(row), row)
+    return list(unique.items()), str(baseline.get("report_date") or "")
 
 
 def _opp_report_day(report_date=""):
@@ -4168,14 +4222,127 @@ def opportunity_bloomberg_daily_return(request:Request):
     irr_mids=_daily_bloomberg_mid_lookup(snap)
     oom_spots=_daily_bloomberg_oom_lookup(snap)
     live_exp=_live_exposure_estimate(calc, float(b.get("nav_usd") or 0), snap)
-    for r in calc["rows"]:
+    # IMPORTANT: calculations above use ALL positions. Limit only the HTML
+    # table rows for this signed-in viewer, with no change to metrics/exports.
+    with SessionLocal() as db:
+        hidden_by_user=_opp_bloomberg_hidden_by_user(db)
+    visible_rows=_opp_bloomberg_rows_for_viewer(calc["rows"],u["username"],hidden_by_user)
+    for r in visible_rows:
         strike="" if r.get("strike") is None else f'{r["strike"]:g}';name=(f'{r["ticker"]} {r["expiry"]} {r["option_type"]}{strike}' if r["instrument_type"]=="OPTION" else r["ticker"]);manual=r.get("bloomberg_manual_price");mv='' if manual is None else f'{float(manual):.4f}'
         mh=_daily_market_value_html(r)
         fmt=lambda v:'—' if v is None else f'${float(v):.2f}'
         rows+=f'<tr><td>{html.escape(name)}</td><td>{float(r["quantity"]):,.0f}</td><td>{fmt(r.get("baseline_price"))}</td><td>{fmt(r.get("bid"))}</td><td>{fmt(r.get("ask"))}</td><td>{fmt(r.get("market_mark"))}</td><td>{"—" if r.get("change") is None else f"{r["change"]:+.2f}"}</td><td>{mh}</td><td>{"—" if r.get("estimated_pnl") is None else f"${r["estimated_pnl"]:+,.2f}"}</td><td>{html.escape(r.get("effective_source") or "")}</td><td title="{html.escape(_LIVE_EXPOSURE_TOOLTIP, quote=True)}">{_live_exposure_value_html(r, live_exp)}</td><td title="{html.escape(_DAILY_BLOOMBERG_IRR_TOOLTIP, quote=True)}">{_daily_bloomberg_irr_html(r, irr_mids, spot_lookup=oom_spots)}</td><td>{_daily_bloomberg_oom_html(r, oom_spots)}</td></tr>'
     status="FULL" if calc["complete"] else "PARTIAL";warn='' if calc["complete"] else '<div class="notice"><strong>PARTIAL:</strong> Bloomberg has not supplied a usable current mark for every Opportunity position.</div><br>'
     body=f'''<h1>RPD Opportunity Fund — Bloomberg Daily Return</h1>{_fund_export_buttons("opportunity")}<div class="grid bloomberg-live-exposure-grid"><div class="card metric"><div class="muted">Status</div><div class="v {'ok' if calc['complete'] else 'bad'}">{status}</div></div><div class="card metric"><div class="muted">Estimated Daily Return</div><div class="v">{ret:+.4f}%</div></div>{_live_exposure_metric_html(live_exp)}<div class="card metric"><div class="muted">Estimated P&amp;L</div><div class="v">${pnl:+,.2f}</div></div><div class="card metric"><div class="muted">Baseline NAV</div><div class="v">${float(b.get('nav_usd') or 0):,.2f}</div><div class="muted">Report {html.escape(str(b.get('report_date') or ''))}</div></div><div class="card metric"><div class="muted">Coverage</div><div class="v">{calc['coverage_valid']}/{calc['coverage_total']}</div><div class="muted">Bloomberg marks</div></div></div>{warn}<div class="card"><div class="muted">Collector snapshot</div>{html.escape(format_new_york_time((snap or {}).get('timestamp_utc','')))}</div><div class="card daily-return-card">{_MARKET_VALUE_MOBILE_NOTE_HTML}<table class="daily-return-table daily-bloomberg"><thead><tr><th>Position</th><th>Qty</th><th>Previous Mark</th><th>Bloomberg Bid</th><th>Bloomberg Ask</th><th>Bloomberg Market</th><th>Change</th>{_MARKET_VALUE_HEADER_HTML}<th>Estimated P&amp;L</th><th>Effective Source</th>{_LIVE_EXPOSURE_HEADER}{_DAILY_BLOOMBERG_IRR_HEADER}{_DAILY_BLOOMBERG_OOM_HEADER}</tr></thead><tbody>{rows}</tbody></table></div>'''
-    return page("Opportunity Bloomberg Daily Return",body,u,60 if auto_refresh_allowed() else None)
+    response=page("Opportunity Bloomberg Daily Return",body,u,60 if auto_refresh_allowed() else None)
+    response.headers["Cache-Control"]="private, no-store"
+    return response
+
+@app.get("/admin/opportunity/bloomberg-visibility")
+def opportunity_bloomberg_visibility_admin(request:Request, user:str="", saved:str=""):
+    u=require_admin(request)
+    with SessionLocal() as db:
+        viewers=[x for x in db.query(User).order_by(User.username).all()
+                 if x.username!=ADMIN_USER]
+        configurations=_opp_bloomberg_hidden_by_user(db)
+        positions, report_date=_opp_bloomberg_visibility_positions(db)
+
+    viewer_names=[x.username for x in viewers]
+    selected=user.strip().lower() if user.strip().lower() in viewer_names else (viewer_names[0] if viewer_names else "")
+    current_hidden=set(configurations.get(selected, []))
+    position_keys={key for key,_row in positions}
+    missing_keys=sorted(current_hidden-position_keys)
+
+    style="""<style>
+.opp-vis-table{min-width:590px}.opp-vis-table th:first-child,.opp-vis-table td:first-child{text-align:center;width:85px}
+.opp-vis-checkbox{display:inline-flex;align-items:center;justify-content:center;gap:7px;cursor:pointer;min-height:30px}
+.opp-vis-checkbox input{width:17px;height:17px;cursor:pointer;accent-color:#185a9d}
+.opp-vis-controls{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin:10px 0 15px}
+.opp-vis-controls select{min-width:190px}.opp-vis-caption{color:#536985;font-size:12.5px;line-height:1.5}
+.opp-vis-current{background:#eef6ff;color:#174c83;border:1px solid #d0e4fa;padding:10px 12px;border-radius:9px;margin:10px 0}
+.opp-vis-table tr.is-hidden td{background:#fff9ed}
+</style>"""
+    if not viewers:
+        content='<div class="card"><p>No viewer accounts are available. Create a viewer in <a href="/admin/users">User Management</a>.</p></div>'
+    else:
+        options=''.join(f'<option value="{html.escape(x.username,quote=True)}" '
+                        f'{"selected" if x.username==selected else ""}>'
+                        f'{html.escape(x.username)}{" (disabled)" if not x.active else ""}</option>'
+                        for x in viewers)
+        selector=(f'<form method="get" action="/admin/opportunity/bloomberg-visibility" class="opp-vis-controls">'
+                  f'<label>Select viewer<select name="user" onchange="this.form.submit()">{options}</select></label>'
+                  f'<button class="secondary" type="submit">Load user</button></form>')
+        saved_notice=('<div class="opp-vis-current"><strong>Saved.</strong> '
+                      'This viewer will not see the checked rows on the Opportunity Bloomberg Daily Return page.</div>'
+                      if saved=="1" else "")
+        table_rows=[]
+        for key,row in positions:
+            checked=' checked' if key in current_hidden else ''
+            label=html.escape(_opp_position_label(row))
+            quantity=f'{float(row.get("quantity") or 0):,.0f}'
+            mark=row.get('baseline_price')
+            previous='—' if mark is None else f'${float(mark):,.2f}'
+            table_rows.append(
+                f'<tr class="{"is-hidden" if checked else ""}">'
+                f'<td><label class="opp-vis-checkbox" title="Hide this row for the selected viewer">'
+                f'<input class="opp-vis-check" type="checkbox" name="position_key" '
+                f'value="{html.escape(key,quote=True)}"{checked}><span>Hide</span></label></td>'
+                f'<td>{label}</td><td>{quantity}</td><td>{previous}</td></tr>')
+        for key in missing_keys:
+            table_rows.append(
+                f'<tr class="is-hidden"><td><label class="opp-vis-checkbox">'
+                f'<input class="opp-vis-check" type="checkbox" name="position_key" '
+                f'value="{html.escape(key,quote=True)}" checked><span>Hide</span></label></td>'
+                f'<td>{html.escape(key.replace("|"," · "))} <span class="muted">(not in current P&amp;L)</span></td>'
+                f'<td>—</td><td>—</td></tr>')
+        table=''.join(table_rows) or '<tr><td colspan="4">No Opportunity Bloomberg Daily Return positions loaded yet.</td></tr>'
+        content=(f'<div class="card"><h2>Viewer: {html.escape(selected)}</h2>{selector}{saved_notice}'
+                 f'<p class="opp-vis-caption">Tick <strong>Hide</strong> beside the positions this user should NOT see. '
+                 f'Saving replaces this user\'s existing selections only; all other viewers are unchanged. '
+                 f'Positions are identified by ticker, instrument type, expiry, option type and strike, so the rule persists across P&amp;L uploads. '
+                 f'The full calculations, NAV, P&amp;L, Live Exposure, other pages and report exports are NOT modified.</p>'
+                 f'<div class="opp-vis-current"><strong>{len(current_hidden)}</strong> hidden positions saved for '
+                 f'<strong>{html.escape(selected)}</strong> · Current Opportunity report: {html.escape(report_date or "not uploaded")}</div>'
+                 f'<form method="post" action="/admin/opportunity/bloomberg-visibility">'
+                 f'<input type="hidden" name="username" value="{html.escape(selected,quote=True)}">'
+                 f'<div class="opp-vis-controls"><button type="button" class="secondary" onclick="document.querySelectorAll(\'.opp-vis-check\').forEach(x=>x.checked=true)">Select all</button>'
+                 f'<button type="button" class="secondary" onclick="document.querySelectorAll(\'.opp-vis-check\').forEach(x=>x.checked=false)">Clear all</button>'
+                 f'<button type="submit">Save Visibility for {html.escape(selected)}</button></div>'
+                 f'<div style="overflow-x:auto"><table class="opp-vis-table"><thead><tr><th>Hide</th><th>Position</th><th>Qty</th><th>Previous Mark</th></tr></thead>'
+                 f'<tbody>{table}</tbody></table></div>'
+                 f'<div style="margin-top:14px"><button type="submit">Save Visibility for {html.escape(selected)}</button></div>'
+                 f'</form></div>')
+    body=(admin_tabs()+style+'<h1>Opportunity Bloomberg Row Visibility</h1>'
+          '<div class="card"><p><strong>Display-only, per-user setting.</strong> '
+          'Only the individual position rows on <a href="/opportunity/bloomberg-daily-return">'
+          'Opportunity Bloomberg Daily Return</a> are hidden for the chosen viewer. '
+          'No positions are removed, and financial calculations and reports remain unchanged. '
+          'The Admin always sees every row.</p></div>'+content)
+    return page("Opportunity Bloomberg Visibility",body,u)
+
+
+@app.post("/admin/opportunity/bloomberg-visibility")
+async def opportunity_bloomberg_visibility_save(request:Request):
+    u=require_admin(request)
+    form=await request.form()
+    name=str(form.get("username") or "").strip().lower()
+    requested=set(str(x) for x in form.getlist("position_key"))
+    with SessionLocal() as db:
+        viewer=db.query(User).filter_by(username=name).first()
+        if not viewer or name==ADMIN_USER or viewer.role=="admin":
+            raise HTTPException(400,"Choose a valid viewer account.")
+        saved=_opp_bloomberg_hidden_by_user(db)
+        positions,_report_day=_opp_bloomberg_visibility_positions(db)
+        allowed={key for key,_row in positions} | set(saved.get(name, []))
+        if not requested.issubset(allowed):
+            raise HTTPException(400,"Unrecognized position selection. Reload the page and retry.")
+        saved[name]=sorted(requested)
+        _set_json_setting(db,_OPP_BLOOMBERG_ROW_VISIBILITY_KEY,saved)
+        audit(db,u["username"],"OPPORTUNITY_BLOOMBERG_VIEWER_VISIBILITY",
+              f"viewer={name}; hidden_count={len(requested)}; position_ids={','.join(sorted(requested)[:10])}")
+        db.commit()
+    return RedirectResponse("/admin/opportunity/bloomberg-visibility?user="+quote(name)+"&saved=1",303)
+
 
 @app.get("/admin/opportunity")
 def opportunity_admin(request:Request):
